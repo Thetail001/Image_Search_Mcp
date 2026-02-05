@@ -33,6 +33,8 @@ PicImageSearch/
 quick_test.py
 test_logic.py
 inspect_lib.py
+integration_test.py
+test_report.md
 
 # MCP/Project specific
 tmp/

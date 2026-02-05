@@ -44,16 +44,15 @@ def main():
         try:
             import uvicorn
             from starlette.applications import Starlette
-            from starlette.routing import Route
+            from starlette.routing import Route, Mount
             from mcp.server.sse import SseServerTransport
 
             # 1. Initialize SSE transport
-            # The transport handles the /sse and /messages endpoints
             sse = SseServerTransport("/messages")
 
-            # 2. Define the ASGI app routes manually to match FastMCP internal logic
-            async def handle_sse(request):
-                async with sse.connect_sse(request.scope, request.receive, request.send) as (read_stream, write_stream):
+            # 2. Define the SSE handler as a raw ASGI app to get scope, receive, send
+            async def handle_sse(scope, receive, send):
+                async with sse.connect_sse(scope, receive, send) as (read_stream, write_stream):
                     # Use the underlying server from FastMCP instance
                     await mcp._server.run(
                         read_stream,
@@ -64,7 +63,8 @@ def main():
             starlette_app = Starlette(
                 debug=True,
                 routes=[
-                    Route("/sse", endpoint=handle_sse),
+                    # Mount handles the path prefix and passes raw ASGI arguments
+                    Mount("/sse", app=handle_sse),
                     Route("/messages", endpoint=sse.handle_post_message, methods=["POST"]),
                 ]
             )

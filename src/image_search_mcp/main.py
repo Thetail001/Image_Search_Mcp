@@ -54,10 +54,10 @@ def main():
             async def handle_sse(scope, receive, send):
                 async with sse.connect_sse(scope, receive, send) as (read_stream, write_stream):
                     # Use the underlying server from FastMCP instance
-                    await mcp._server.run(
+                    await mcp.server.run(
                         read_stream,
                         write_stream,
-                        mcp._server.create_initialization_options()
+                        mcp.server.create_initialization_options()
                     )
 
             starlette_app = Starlette(

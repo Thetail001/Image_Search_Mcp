@@ -43,12 +43,15 @@ def main():
     if args.sse:
         try:
             import uvicorn
-            # Attempt to find the ASGI app from FastMCP instance
-            app = mcp
-            if hasattr(mcp, "_sse_app"):
-                app = mcp._sse_app
-            elif hasattr(mcp, "app"):
-                app = mcp.app
+            # FastMCP's Starlette app is usually available via the ._app attribute 
+            # after some initialization, or we can use its built-in server logic.
+            # To apply middleware, we need the actual ASGI app.
+            
+            # This is a more robust way to get the ASGI app from FastMCP
+            from mcp.server.fastmcp import FastMCP
+            
+            # Force initialization of the SSE app if possible
+            app = mcp.as_asgi_app()
             
             # Check for Auth Token
             auth_token = os.environ.get("MCP_AUTH_TOKEN")
@@ -58,11 +61,10 @@ def main():
             
             print(f"Starting SSE server on {args.host}:{args.port}...")
             uvicorn.run(app, host=args.host, port=args.port)
-        except ImportError:
-            print("Error: 'uvicorn' is required for SSE mode. Please install it: pip install uvicorn")
-            sys.exit(1)
         except Exception as e:
             print(f"Error starting SSE server: {e}")
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
     else:
         # Stdio mode (Default)

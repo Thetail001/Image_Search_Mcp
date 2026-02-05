@@ -65,7 +65,7 @@ def main():
                 debug=True,
                 routes=[
                     Route("/sse", endpoint=handle_sse),
-                    Route("/messages", endpoint=sse.handle_messages, methods=["POST"]),
+                    Route("/messages", endpoint=sse.handle_post_message, methods=["POST"]),
                 ]
             )
 

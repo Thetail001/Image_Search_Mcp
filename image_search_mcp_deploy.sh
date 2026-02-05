@@ -7,35 +7,80 @@
 set -e
 
 echo "------------------------------------------------"
-echo "开始部署 Image Search MCP Server..."
+echo "Image Search MCP Server 部署与更新脚本"
 echo "------------------------------------------------"
+
+# 寻找 uv 可执行文件路径的函数
+find_uv() {
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    local uv_path=$(which uv || echo "")
+    if [ -z "$uv_path" ]; then
+        if [ -f "$HOME/.local/bin/uv" ]; then uv_path="$HOME/.local/bin/uv";
+        elif [ -f "$HOME/.cargo/bin/uv" ]; then uv_path="$HOME/.cargo/bin/uv"; fi
+    fi
+    echo "$uv_path"
+}
+
+UV_BIN=$(find_uv)
+
+# 检查是否已安装
+if [ -f ".env" ] && [ -n "$UV_BIN" ]; then
+    echo "检测到已有配置和 uv 环境。"
+    read -p "是否仅更新服务代码并重启? (y/n, 默认 y): " IS_UPDATE
+    IS_UPDATE=${IS_UPDATE:-y}
+
+    if [ "$IS_UPDATE" = "y" ]; then
+        echo -e "\n[1/3] 正在升级 image-search-mcp..."
+        "$UV_BIN" tool upgrade image-search-mcp || "$UV_BIN" tool install --python 3.12 image-search-mcp
+        
+        echo "[2/3] 重载并重启服务..."
+        sudo systemctl restart image-search
+        
+        echo "[3/3] 检查状态..."
+        sleep 2
+        echo "服务状态: $(sudo systemctl is-active image-search)"
+        echo "✅ 更新完成！"
+        echo "查看日志: journalctl -u image-search -f"
+        exit 0
+    fi
+fi
 
 # 1. 交互式收集配置
 echo "[1/6] 配置运行参数:"
-read -p "请输入服务监听端口 (默认 8000): " PORT
-PORT=${PORT:-8000}
+# 尝试从旧 .env 读取默认值
+[ -f .env ] && source .env || true
 
-echo -e "\n[2/6] 配置环境变量 (直接按回车可跳过不填):"
-read -p "请输入 MCP_AUTH_TOKEN (用于客户端连接认证，建议填写): " AUTH_TOKEN
-read -p "请输入 SauceNAO API Key: " SAUCE_KEY
-read -p "请输入通用 Cookies (用于 Google/Bing 等): " COOKIES
-read -p "请输入 HTTP 代理 (例如 http://127.0.0.1:7890): " PROXY
+read -p "请输入服务监听端口 (当前: ${PORT:-8000}): " NEW_PORT
+PORT=${NEW_PORT:-${PORT:-8000}}
+
+echo -e "\n[2/6] 配置环境变量 (直接按回车保留当前值或跳过):"
+read -p "请输入 MCP_AUTH_TOKEN: " NEW_AUTH_TOKEN
+MCP_AUTH_TOKEN=${NEW_AUTH_TOKEN:-${MCP_AUTH_TOKEN}}
+
+read -p "请输入 SauceNAO API Key: " NEW_SAUCE_KEY
+IMAGE_SEARCH_API_KEY=${NEW_SAUCE_KEY:-${IMAGE_SEARCH_API_KEY}}
+
+read -p "请输入通用 Cookies: " NEW_COOKIES
+IMAGE_SEARCH_COOKIES=${NEW_COOKIES:-${IMAGE_SEARCH_COOKIES}}
+
+read -p "请输入 HTTP 代理: " NEW_PROXY
+IMAGE_SEARCH_PROXY=${NEW_PROXY:-${IMAGE_SEARCH_PROXY}}
 
 # 写入当前目录下的 .env 文件
 cat << EOF > .env
 # 基础运行配置
 HOST=0.0.0.0
 PORT=${PORT}
-MCP_AUTH_TOKEN=${AUTH_TOKEN}
+MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
 
 # 搜图引擎可选配置
-IMAGE_SEARCH_API_KEY=${SAUCE_KEY}
-IMAGE_SEARCH_COOKIES=${COOKIES}
-IMAGE_SEARCH_PROXY=${PROXY}
+IMAGE_SEARCH_API_KEY=${IMAGE_SEARCH_API_KEY}
+IMAGE_SEARCH_COOKIES=${IMAGE_SEARCH_COOKIES}
+IMAGE_SEARCH_PROXY=${IMAGE_SEARCH_PROXY}
 EOF
 
 chmod 600 .env
-echo -e "\n配置已保存至当前目录下的 .env 文件。"
+echo -e "\n配置已保存至 .env 文件。"
 
 # 2. 安装基础工具
 echo -e "\n[3/6] 安装基础工具 (curl)..."

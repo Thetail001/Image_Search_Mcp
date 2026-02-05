@@ -45,9 +45,12 @@ def main():
             import uvicorn
             
             # The most robust way to get the ASGI app from FastMCP (v2.3.2+)
-            # This app already includes the necessary SSE routes (/sse, /messages)
+            # Explicitly setting path="/" ensures /sse and /messages are at the root
             if hasattr(mcp, "http_app"):
-                app = mcp.http_app()
+                try:
+                    app = mcp.http_app(path="/")
+                except Exception:
+                    app = mcp.http_app()
             elif hasattr(mcp, "as_asgi_app"):
                 app = mcp.as_asgi_app()
             else:
@@ -61,7 +64,9 @@ def main():
                 app = AuthMiddleware(app, auth_token)
             
             print(f"Starting SSE server on {args.host}:{args.port}...")
-            uvicorn.run(app, host=args.host, port=args.port)
+            # uvicorn.run(app, host=args.host, port=args.port)
+            # Use a slightly more verbose uvicorn config for debugging
+            uvicorn.run(app, host=args.host, port=args.port, log_level="info")
             
             # 3. Apply Auth Middleware if token is provided
             auth_token = os.environ.get("MCP_AUTH_TOKEN")

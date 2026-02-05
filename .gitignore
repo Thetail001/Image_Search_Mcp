@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PicImageSearch specific (if any local sources were kept, though we removed them)
+PicImageSearch/
+
+# Local settings/testing
+.env
+quick_test.py
+test_logic.py
+inspect_lib.py
+
+# MCP/Project specific
+tmp/
+.gemini/

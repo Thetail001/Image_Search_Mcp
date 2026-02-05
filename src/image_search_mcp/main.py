@@ -43,17 +43,35 @@ def main():
     if args.sse:
         try:
             import uvicorn
-            # FastMCP's Starlette app is usually available via the ._app attribute 
-            # after some initialization, or we can use its built-in server logic.
-            # To apply middleware, we need the actual ASGI app.
+            from starlette.applications import Starlette
+            from starlette.routing import Route
+            from mcp.server.sse import SseServerTransport
+
+            # 1. Initialize SSE transport
+            # The transport handles the /sse and /messages endpoints
+            sse = SseServerTransport("/messages")
+
+            # 2. Define the ASGI app routes manually to match FastMCP internal logic
+            async def handle_sse(request):
+                async with sse.connect_sse(request.scope, request.receive, request.send) as (read_stream, write_stream):
+                    # Use the underlying server from FastMCP instance
+                    await mcp._server.run(
+                        read_stream,
+                        write_stream,
+                        mcp._server.create_initialization_options()
+                    )
+
+            starlette_app = Starlette(
+                debug=True,
+                routes=[
+                    Route("/sse", endpoint=handle_sse),
+                    Route("/messages", endpoint=sse.handle_messages, methods=["POST"]),
+                ]
+            )
+
+            app = starlette_app
             
-            # This is a more robust way to get the ASGI app from FastMCP
-            from mcp.server.fastmcp import FastMCP
-            
-            # Force initialization of the SSE app if possible
-            app = mcp.as_asgi_app()
-            
-            # Check for Auth Token
+            # 3. Apply Auth Middleware if token is provided
             auth_token = os.environ.get("MCP_AUTH_TOKEN")
             if auth_token:
                 print(f"🔒 Authentication enabled. Require Bearer token.")

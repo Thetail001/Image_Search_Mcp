@@ -43,33 +43,25 @@ def main():
     if args.sse:
         try:
             import uvicorn
-            from starlette.applications import Starlette
-            from starlette.routing import Route, Mount
-            from mcp.server.sse import SseServerTransport
+            
+            # The most robust way to get the ASGI app from FastMCP (v2.3.2+)
+            # This app already includes the necessary SSE routes (/sse, /messages)
+            if hasattr(mcp, "http_app"):
+                app = mcp.http_app()
+            elif hasattr(mcp, "as_asgi_app"):
+                app = mcp.as_asgi_app()
+            else:
+                # Fallback to internal app if methods are missing
+                app = getattr(mcp, "_app", mcp)
 
-            # 1. Initialize SSE transport
-            sse = SseServerTransport("/messages")
-
-            # 2. Define the SSE handler as a raw ASGI app to get scope, receive, send
-            async def handle_sse(scope, receive, send):
-                async with sse.connect_sse(scope, receive, send) as (read_stream, write_stream):
-                    # Use the underlying server from FastMCP instance
-                    await mcp.server.run(
-                        read_stream,
-                        write_stream,
-                        mcp.server.create_initialization_options()
-                    )
-
-            starlette_app = Starlette(
-                debug=True,
-                routes=[
-                    # Mount handles the path prefix and passes raw ASGI arguments
-                    Mount("/sse", app=handle_sse),
-                    Route("/messages", endpoint=sse.handle_post_message, methods=["POST"]),
-                ]
-            )
-
-            app = starlette_app
+            # Check for Auth Token
+            auth_token = os.environ.get("MCP_AUTH_TOKEN")
+            if auth_token:
+                print(f"🔒 Authentication enabled. Require Bearer token.")
+                app = AuthMiddleware(app, auth_token)
+            
+            print(f"Starting SSE server on {args.host}:{args.port}...")
+            uvicorn.run(app, host=args.host, port=args.port)
             
             # 3. Apply Auth Middleware if token is provided
             auth_token = os.environ.get("MCP_AUTH_TOKEN")

@@ -338,24 +338,47 @@ async def _search_image_logic(
         return f"An error occurred during search: {str(e)}\n{traceback.format_exc()}"
 
 @mcp.tool()
+
 async def search_image(
+
     source: str,
+
     engine: str = "Yandex", 
+
     extra_params_json: Optional[str] = None,
+
     limit: int = 5
+
 ) -> str:
+
     """
+
     Perform a reverse image search.
+
     
+
     Args:
-        source: The image URL or Base64 encoded string.
+
+        source: The image input. 
+
+                IMPORTANT: 
+
+                1. If you have a public image URL, ALWAYS use the URL.
+
+                2. If you have image data, use Base64 encoded string.
+
+                3. NEVER provide a local file path (e.g., /AstrBot/data/...), as the server cannot access your local files.
+
         engine: The search engine to use (default: "Yandex").
+
                 Other supported engines: SauceNAO, Google, TraceMoe, Ascii2D, EHentai, etc.
+
                 Use `get_engine_info` tool to see the full list and capabilities.
+
         extra_params_json: (Optional) JSON string for advanced engine parameters.
-                           Use `get_engine_info(engine_name='EngineName')` to see available parameters for a specific engine.
+
         limit: Max number of results to return (default: 5).
-    
-    Note: API Key, Cookies, and Proxy should be configured via environment variables.
+
     """
+
     return await _search_image_logic(source, engine, extra_params_json, limit)

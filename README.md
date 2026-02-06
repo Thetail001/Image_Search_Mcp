@@ -91,7 +91,7 @@ uvx image-search-mcp --sse --host 0.0.0.0 --port 8000
 | `HTTP_PROXY` / `HTTPS_PROXY` | 通用系统代理 (备选) | `http://127.0.0.1:7890` |
 
 ### 关于 Cookies 的重要提示
-Google, Bing, GoogleLens 和 Tineye 等引擎经常会有机器人验证（CAPTCHA）。如果搜索返回 "No results found" 或提示 Bot Protection，请尝试在浏览器中访问对应搜索引擎，登录并获取 Cookies，然后设置到 `IMAGE_SEARCH_COOKIES` 环境变量中。
+Yandex, Google, Bing, GoogleLens 和 Tineye 等引擎经常会有机器人验证（CAPTCHA）。如果搜索返回 "No results found" 或提示 Bot Protection，请尝试在浏览器中访问对应搜索引擎，登录并获取 Cookies，然后设置到 `IMAGE_SEARCH_COOKIES` 环境变量中。
 
 ---
 

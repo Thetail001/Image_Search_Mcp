@@ -11,7 +11,7 @@ except ImportError:
     from mcp.server.fastmcp import FastMCP
 
 from PicImageSearch import (
-    SauceNAO, Google, TraceMoe, Ascii2D, BaiDu, Bing, 
+    Network, SauceNAO, Google, TraceMoe, Ascii2D, BaiDu, Bing, 
     EHentai, GoogleLens, Iqdb, Tineye, Yandex
 )
 
@@ -220,6 +220,14 @@ def _format_result_item(item: Any, engine: str) -> str:
         if hasattr(item, "date") and item.date:
             lines.append(f"Date: {item.date}")
             
+    elif engine == "Yandex":
+        if hasattr(item, "source") and item.source:
+            lines.append(f"Source: {item.source}")
+        if hasattr(item, "content") and item.content:
+            lines.append(f"Content: {item.content}")
+        if hasattr(item, "size") and item.size:
+            lines.append(f"Size: {item.size}")
+
     # Fallback for generic lists of URLs (like ext_urls)
     if hasattr(item, "ext_urls") and item.ext_urls:
         lines.append(f"External URLs: {item.ext_urls}")
@@ -252,18 +260,18 @@ async def _search_image_logic(
         if not engine_cls:
             return f"Error: Unsupported engine '{engine}'. Use get_engine_info('all') to see available options."
         
-        # 2. Configure Engine Initialization Args
-        init_kwargs = {}
+        # 2. Configure Network/Engine Args
+        network_kwargs = {}
         if proxy:
-            init_kwargs["proxies"] = _parse_proxy(proxy)
+            network_kwargs["proxies"] = _parse_proxy(proxy)
         
-        # Parse cookies if provided
         cookie_dict = {}
         if cookies:
             cookie_dict = _parse_cookies(cookies)
-            init_kwargs["cookies"] = cookie_dict
+            network_kwargs["cookies"] = cookie_dict
 
         # Engine-specific Init Params
+        init_kwargs = {}
         if engine == "SauceNAO":
             if api_key:
                 init_kwargs["api_key"] = api_key
@@ -281,28 +289,30 @@ async def _search_image_logic(
             if "bovw" in extra_params:
                 init_kwargs["bovw"] = extra_params.pop("bovw")
 
-        # 3. Instantiate Engine
-        client = engine_cls(**init_kwargs)
+        # 3. Execute Search within Network context
+        async with Network(**network_kwargs) as net:
+            # Instantiate Engine with the network client
+            client = engine_cls(client=net, **init_kwargs)
 
-        # 4. Prepare Search Arguments
-        search_kwargs = {}
-        
-        if source.strip().lower().startswith(("http://", "https://")):
-            search_kwargs["url"] = source.strip()
-        else:
-            b64_str = source
-            if "," in b64_str:
-                b64_str = b64_str.split(",")[1]
-            try:
-                image_bytes = base64.b64decode(b64_str)
-                search_kwargs["file"] = image_bytes
-            except Exception as e:
-                return f"Error decoding Base64 string: {str(e)}"
-        
-        search_kwargs.update(extra_params)
+            # 4. Prepare Search Arguments
+            search_kwargs = {}
+            
+            if source.strip().lower().startswith(("http://", "https://")):
+                search_kwargs["url"] = source.strip()
+            else:
+                b64_str = source
+                if "," in b64_str:
+                    b64_str = b64_str.split(",")[1]
+                try:
+                    image_bytes = base64.b64decode(b64_str)
+                    search_kwargs["file"] = image_bytes
+                except Exception as e:
+                    return f"Error decoding Base64 string: {str(e)}"
+            
+            search_kwargs.update(extra_params)
 
-        # 5. Execute Search
-        resp = await client.search(**search_kwargs)
+            # 5. Execute Search
+            resp = await client.search(**search_kwargs)
 
         # 6. Format Result
         result_str = f"Search Engine: {engine}\n"
@@ -316,8 +326,8 @@ async def _search_image_logic(
                 result_str += "\n"
         else:
             result_str += f"No results found or raw data unavailable.\n"
-            if engine in ["Google", "Bing", "GoogleLens", "Tineye"]:
-                result_str += "Hint: These engines often require 'IMAGE_SEARCH_COOKIES' to be set in .env to bypass bot protection.\n"
+            if engine in ["Yandex", "Google", "Bing", "GoogleLens", "Tineye"]:
+                result_str += f"Hint: '{engine}' often requires 'IMAGE_SEARCH_COOKIES' (and sometimes a proxy) to bypass bot protection.\n"
             result_str += f"Response: {resp}"
             
         return result_str

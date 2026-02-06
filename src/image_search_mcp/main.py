@@ -11,13 +11,25 @@ class AuthMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            # Allow health checks or OPTIONS if needed, but for strict security check everything
+            # Allow health checks (root path /) to pass without auth
+            if scope.get("path") == "/":
+                await self.app(scope, receive, send)
+                return
+
+            # Allow health checks or OPTIONS if needed
             headers = dict(scope.get("headers", []))
             auth_header = headers.get(b"authorization", b"").decode("utf-8")
             
             # Check for "Bearer <token>"
-            expected = f"Bearer {self.token}"
-            if not auth_header or auth_header != expected:
+            # Be a bit more flexible with whitespace and casing of "Bearer"
+            authorized = False
+            if auth_header:
+                parts = auth_header.split(None, 1)
+                if len(parts) == 2 and parts[0].lower() == "bearer":
+                    if parts[1].strip() == self.token.strip():
+                        authorized = True
+            
+            if not authorized:
                 await send({
                     'type': 'http.response.start',
                     'status': 401,
@@ -45,32 +57,47 @@ def main():
             import uvicorn
             # Use the official SSE app creator from FastMCP
             try:
-                from mcp.server.fastmcp import create_sse_app
-                app = create_sse_app(mcp, sse_path="/sse", message_path="/messages")
-            except ImportError:
+                if hasattr(mcp, "http_app"):
+                    # Modern FastMCP (2.x) uses http_app with transport="sse"
+                    app = mcp.http_app(transport="sse")
+                else:
+                    from mcp.server.fastmcp import create_sse_app
+                    app = create_sse_app(mcp, sse_path="/sse", message_path="/messages")
+            except Exception as e:
+                print(f"Warning: Failed to use standard SSE app creation: {e}")
                 # Fallback for different versions
                 if hasattr(mcp, "http_app"):
                     app = mcp.http_app(path="/")
                 else:
                     app = getattr(mcp, "_app", mcp)
 
+            # Add a basic root route for connectivity testing
+            try:
+                from starlette.responses import JSONResponse
+                from starlette.routing import Route
+                async def homepage(request):
+                    return JSONResponse({
+                        "status": "running",
+                        "service": "Image Search MCP Server",
+                        "endpoints": {
+                            "sse": "/sse",
+                            "messages": "/messages"
+                        }
+                    })
+                # Check if we can add a route
+                if hasattr(app, "routes"):
+                    app.routes.insert(0, Route("/", homepage))
+            except Exception:
+                pass
+
             # Check for Auth Token
             auth_token = os.environ.get("MCP_AUTH_TOKEN")
             if auth_token:
-                print(f"🔒 Authentication enabled. Require Bearer token.")
+                print(f"Authentication enabled. Require Bearer token.")
                 app = AuthMiddleware(app, auth_token)
             
             print(f"Starting SSE server on {args.host}:{args.port}...")
             uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-            
-            # 3. Apply Auth Middleware if token is provided
-            auth_token = os.environ.get("MCP_AUTH_TOKEN")
-            if auth_token:
-                print(f"🔒 Authentication enabled. Require Bearer token.")
-                app = AuthMiddleware(app, auth_token)
-            
-            print(f"Starting SSE server on {args.host}:{args.port}...")
-            uvicorn.run(app, host=args.host, port=args.port)
         except Exception as e:
             print(f"Error starting SSE server: {e}")
             import traceback

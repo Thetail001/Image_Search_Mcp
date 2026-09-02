@@ -1,8 +1,6 @@
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 import json
 import base64
-import traceback
-import sys
 import os
 
 try:
@@ -31,6 +29,21 @@ ENGINES = {
     "Iqdb": Iqdb,
     "Tineye": Tineye,
     "Yandex": Yandex
+}
+
+DEFAULT_ENGINE = "Yandex"
+ALL_ENGINE = "All"
+DEFAULT_ENGINE_ENV = "IMAGE_SEARCH_DEFAULT_ENGINE"
+
+ENGINE_INIT_PARAMS = {
+    "SauceNAO": ("numres", "hide", "minsim", "db", "output_type", "testmode"),
+    "EHentai": ("is_ex", "covers", "similar", "exp"),
+    "Ascii2D": ("bovw",),
+}
+
+ENGINE_SEARCH_PARAMS = {
+    "Yandex": ("rpt", "cbir_page"),
+    "TraceMoe": ("cutBorders",),
 }
 
 # Engine Information (Briefs & Advanced Params)
@@ -122,15 +135,15 @@ def _parse_cookies(cookie_str: str) -> Dict[str, str]:
     return cookies
 
 @mcp.tool()
-def get_engine_info(engine_name: str = "all") -> str:
+def get_engine_info(engine_name: str = ALL_ENGINE) -> str:
     """
     Get information about supported search engines.
     
     Args:
-        engine_name: The name of the engine to get details for, or "all" for a summary list.
-                     Default: "all".
+        engine_name: The name of the engine to get details for, or "All" for a summary list.
+                     Default: "All".
     """
-    if engine_name.lower() == "all":
+    if engine_name.casefold() == ALL_ENGINE.casefold():
         # Return summary list
         summary = ["Supported Search Engines:"]
         for name, info in ENGINE_INFO.items():
@@ -145,7 +158,8 @@ def get_engine_info(engine_name: str = "all") -> str:
             break
     
     if not target_name:
-        return f"Error: Engine '{engine_name}' not found. Supported: {', '.join(ENGINES.keys())}"
+        supported = ", ".join([*ENGINES, ALL_ENGINE])
+        return f"Error: Engine '{engine_name}' not found. Supported: {supported}"
     
     info = ENGINE_INFO[target_name]
     details = [f"=== {target_name} ==="]
@@ -237,7 +251,7 @@ def _format_result_item(item: Any, engine: str) -> str:
 
 async def _search_image_logic(
     source: str,
-    engine: str = "Yandex", 
+    engine: Optional[str] = None,
     extra_params_json: Optional[str] = None,
     limit: int = 5
 ) -> str:
@@ -248,6 +262,20 @@ async def _search_image_logic(
         cookies = os.environ.get("IMAGE_SEARCH_COOKIES")
         proxy = os.environ.get("IMAGE_SEARCH_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
 
+        # Resolve the default at call time so environment changes are honored.
+        requested_engine = (engine or os.environ.get(DEFAULT_ENGINE_ENV) or DEFAULT_ENGINE).strip()
+        if requested_engine.casefold() == ALL_ENGINE.casefold():
+            selected_engines = list(ENGINES)
+            all_mode = True
+        else:
+            selected_engines = [
+                name for name in ENGINES if name.lower() == requested_engine.lower()
+            ]
+            all_mode = False
+            if not selected_engines:
+                supported = ", ".join([*ENGINES, ALL_ENGINE])
+                return f"Error: Unsupported engine '{requested_engine}'. Supported: {supported}."
+
         # 1. Parse extra params
         extra_params = {}
         if extra_params_json:
@@ -255,10 +283,20 @@ async def _search_image_logic(
                 extra_params = json.loads(extra_params_json)
             except json.JSONDecodeError:
                 return "Error: extra_params_json is not valid JSON."
+            if not isinstance(extra_params, dict):
+                return "Error: extra_params_json must contain a JSON object."
 
-        engine_cls = ENGINES.get(engine)
-        if not engine_cls:
-            return f"Error: Unsupported engine '{engine}'. Use get_engine_info('all') to see available options."
+        # Decode a Base64 source once and reuse it for every engine.
+        source_value = source.strip()
+        is_url = source_value.lower().startswith(("http://", "https://"))
+        if not is_url:
+            b64_str = source_value
+            if "," in b64_str:
+                b64_str = b64_str.split(",", 1)[1]
+            try:
+                image_bytes = base64.b64decode("".join(b64_str.split()), validate=True)
+            except Exception as e:
+                return f"Error decoding Base64 string: {str(e)}"
         
         # 2. Configure Network/Engine Args
         network_kwargs = {}
@@ -270,72 +308,71 @@ async def _search_image_logic(
             cookie_dict = _parse_cookies(cookies)
             network_kwargs["cookies"] = cookie_dict
 
-        # Engine-specific Init Params
-        init_kwargs = {}
-        if engine == "SauceNAO":
-            if api_key:
-                init_kwargs["api_key"] = api_key
-            for k in ["numres", "hide", "minsim", "db", "output_type", "testmode"]:
-                if k in extra_params:
-                    init_kwargs[k] = extra_params.pop(k)
-        
-        elif engine == "EHentai":
-            # EHentai specific params
-            for k in ["is_ex", "covers", "similar", "exp"]:
-                if k in extra_params:
-                    init_kwargs[k] = extra_params.pop(k)
-        
-        elif engine == "Ascii2D":
-            if "bovw" in extra_params:
-                init_kwargs["bovw"] = extra_params.pop("bovw")
-
         # 3. Execute Search within Network context
         async with Network(**network_kwargs) as net:
-            # Instantiate Engine with the network client
-            client = engine_cls(client=net, **init_kwargs)
-
-            # 4. Prepare Search Arguments
-            search_kwargs = {}
-            
-            if source.strip().lower().startswith(("http://", "https://")):
-                search_kwargs["url"] = source.strip()
-            else:
-                b64_str = source
-                if "," in b64_str:
-                    b64_str = b64_str.split(",")[1]
+            sections = []
+            for engine_name in selected_engines:
                 try:
-                    image_bytes = base64.b64decode(b64_str)
-                    search_kwargs["file"] = image_bytes
+                    engine_cls = ENGINES[engine_name]
+                    engine_params = dict(extra_params)
+                    init_kwargs = {}
+
+                    for key in ENGINE_INIT_PARAMS.get(engine_name, ()):
+                        if key in engine_params:
+                            init_kwargs[key] = engine_params.pop(key)
+                    if engine_name == "SauceNAO" and api_key:
+                        init_kwargs["api_key"] = api_key
+
+                    if all_mode:
+                        search_params = {
+                            key: engine_params[key]
+                            for key in ENGINE_SEARCH_PARAMS.get(engine_name, ())
+                            if key in engine_params
+                        }
+                    else:
+                        search_params = engine_params
+
+                    client = engine_cls(client=net, **init_kwargs)
+                    search_kwargs = {"url": source_value} if is_url else {"file": image_bytes}
+                    search_kwargs.update(search_params)
+                    resp = await client.search(**search_kwargs)
+                    result_str = f"Search Engine: {engine_name}\n"
+                    if hasattr(resp, "raw") and resp.raw:
+                        shown_count = min(len(resp.raw), limit)
+                        result_str += (
+                            f"Found {len(resp.raw)} results "
+                            f"(showing top {shown_count}):\n"
+                        )
+                        for i, item in enumerate(resp.raw[:limit], 1):
+                            result_str += f"\n--- Result {i} ---\n"
+                            result_str += _format_result_item(item, engine_name)
+                            result_str += "\n"
+                    else:
+                        result_str += "No results found or raw data unavailable.\n"
+                        if engine_name in ["Yandex", "Google", "Bing", "GoogleLens", "Tineye"]:
+                            result_str += (
+                                f"Hint: '{engine_name}' often requires "
+                                "'IMAGE_SEARCH_COOKIES' (and sometimes a proxy).\n"
+                            )
+                    sections.append(result_str.rstrip())
                 except Exception as e:
-                    return f"Error decoding Base64 string: {str(e)}"
-            
-            search_kwargs.update(extra_params)
+                    error = f"Search Engine: {engine_name}\nError: {type(e).__name__}: {e}"
+                    if engine_name in ["Yandex", "Google", "Bing", "GoogleLens", "Tineye"]:
+                        error += (
+                            f"\nHint: '{engine_name}' often requires "
+                            "'IMAGE_SEARCH_COOKIES' (and sometimes a proxy)."
+                        )
+                    sections.append(error)
 
-            # 5. Execute Search
-            resp = await client.search(**search_kwargs)
+        if all_mode:
+            return (
+                f"Reverse image search across {len(selected_engines)} engines "
+                f"(limit {limit} per engine):\n\n" + "\n\n".join(sections)
+            )
+        return sections[0]
 
-        # 6. Format Result
-        result_str = f"Search Engine: {engine}\n"
-             
-        if hasattr(resp, "raw") and resp.raw:
-            shown_count = min(len(resp.raw), limit)
-            result_str += f"Found {len(resp.raw)} results (showing top {shown_count}):\n"
-            for i, item in enumerate(resp.raw[:limit]):
-                result_str += f"\n--- Result {i+1} ---\n"
-                result_str += _format_result_item(item, engine)
-                result_str += "\n"
-        else:
-            result_str += f"No results found or raw data unavailable.\n"
-            if engine in ["Yandex", "Google", "Bing", "GoogleLens", "Tineye"]:
-                result_str += f"Hint: '{engine}' often requires 'IMAGE_SEARCH_COOKIES' (and sometimes a proxy) to bypass bot protection.\n"
-            result_str += f"Response: {resp}"
-            
-        return result_str
-
-    except json.JSONDecodeError:
-        return f"Error: Failed to parse response from {engine}. This usually indicates bot protection (CAPTCHA) or an API change. Try setting 'IMAGE_SEARCH_COOKIES' in .env."
     except Exception as e:
-        return f"An error occurred during search: {str(e)}\n{traceback.format_exc()}"
+        return f"An error occurred during search: {type(e).__name__}: {e}"
 
 @mcp.tool()
 
@@ -343,7 +380,7 @@ async def search_image(
 
     source: str,
 
-    engine: str = "Yandex", 
+    engine: Optional[str] = None,
 
     extra_params_json: Optional[str] = None,
 
@@ -369,7 +406,9 @@ async def search_image(
 
                 3. NEVER provide a local file path (e.g., /AstrBot/data/...), as the server cannot access your local files.
 
-        engine: The search engine to use (default: "Yandex").
+                engine: The search engine to use. If omitted, the value of
+                        IMAGE_SEARCH_DEFAULT_ENGINE is used, falling back to "Yandex".
+                        Use "All" to query every supported engine.
 
                 Other supported engines: SauceNAO, Google, TraceMoe, Ascii2D, EHentai, etc.
 

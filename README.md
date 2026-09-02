@@ -7,9 +7,10 @@
 ## ✨ 特性
 
 - **多引擎支持**：集成 11 种主流搜图引擎 (Yandex, SauceNAO, Google, TraceMoe, ASCII2D, EHentai, Iqdb, BaiDu, Bing, GoogleLens, Tineye)。
+- **全引擎模式**：将 `engine` 设置为 `All`，一次调用所有引擎；单个引擎失败不会影响其他结果。
 - **结果精简**：自动移除原始冗余数据，仅返回最关键的标题、链接、缩略图等信息。
 - **智能提示**：当因机器人验证（Bot Protection）导致无结果时，自动提示配置 Cookie。
-- **零配置部署**：通过 `uvx` 直接运行。
+- **零配置部署**：通过 `uvx` 直接运行（Python 3.12）。
 - **安全配置**：API Key 和代理设置通过环境变量管理。
 - **灵活输入**：支持图片 URL 和 Base64 编码。
 
@@ -21,7 +22,7 @@
 
 **Command**:
 ```bash
-uvx image-search-mcp
+uvx --python 3.12 image-search-mcp
 ```
 
 ### 方式 2: SSE 模式 (HTTP Server)
@@ -29,7 +30,7 @@ uvx image-search-mcp
 适用于远程部署或 Web 客户端。
 
 ```bash
-uvx image-search-mcp --sse --port 8000
+uvx --python 3.12 image-search-mcp --sse --port 8000
 ```
 
 #### 🔒 开启安全认证 (可选)
@@ -44,8 +45,9 @@ export MCP_AUTH_TOKEN="my-secret-token-123"
 export IMAGE_SEARCH_API_KEY="your_saucenao_key"
 export IMAGE_SEARCH_COOKIES="your_cookies_here"
 export IMAGE_SEARCH_PROXY="http://127.0.0.1:7890"
+export IMAGE_SEARCH_DEFAULT_ENGINE="BaiDu"
 
-uvx image-search-mcp --sse --host 0.0.0.0 --port 8000
+uvx --python 3.12 image-search-mcp --sse --host 0.0.0.0 --port 8000
 ```
 
 **Windows (PowerShell)**:
@@ -54,8 +56,9 @@ $env:MCP_AUTH_TOKEN="my-secret-token-123"
 $env:IMAGE_SEARCH_API_KEY="your_saucenao_key"
 $env:IMAGE_SEARCH_COOKIES="your_cookies_here"
 $env:IMAGE_SEARCH_PROXY="http://127.0.0.1:7890"
+$env:IMAGE_SEARCH_DEFAULT_ENGINE="BaiDu"
 
-uvx image-search-mcp --sse --host 0.0.0.0 --port 8000
+uvx --python 3.12 image-search-mcp --sse --host 0.0.0.0 --port 8000
 ```
 
 #### 客户端连接示例 (SSE)
@@ -89,6 +92,7 @@ uvx image-search-mcp --sse --host 0.0.0.0 --port 8000
 | `IMAGE_SEARCH_COOKIES` | 通用 Cookies (用于 Google, Bing, Tineye, EHentai 等) | `igneous=...; ipb_member_id=...` |
 | `IMAGE_SEARCH_PROXY` | HTTP 代理地址 (优先级最高) | `http://127.0.0.1:7890` |
 | `HTTP_PROXY` / `HTTPS_PROXY` | 通用系统代理 (备选) | `http://127.0.0.1:7890` |
+| `IMAGE_SEARCH_DEFAULT_ENGINE` | 未提供 `engine` 时使用的引擎，也可设为 `All` | `BaiDu` |
 
 ### 关于 Cookies 的重要提示
 Yandex, Google, Bing, GoogleLens 和 Tineye 等引擎经常会有机器人验证（CAPTCHA）。如果搜索返回 "No results found" 或提示 Bot Protection，请尝试在浏览器中访问对应搜索引擎，登录并获取 Cookies，然后设置到 `IMAGE_SEARCH_COOKIES` 环境变量中。
@@ -106,11 +110,12 @@ Yandex, Google, Bing, GoogleLens 和 Tineye 等引擎经常会有机器人验证
   "mcpServers": {
     "image-search-local": {
       "command": "uvx",
-      "args": ["image-search-mcp"],
+      "args": ["--python", "3.12", "image-search-mcp"],
       "env": {
         "IMAGE_SEARCH_API_KEY": "your_saucenao_key",
         "IMAGE_SEARCH_COOKIES": "your_cookies",
-        "IMAGE_SEARCH_PROXY": "http://127.0.0.1:7890"
+        "IMAGE_SEARCH_PROXY": "http://127.0.0.1:7890",
+        "IMAGE_SEARCH_DEFAULT_ENGINE": "BaiDu"
       }
     }
   }
@@ -128,7 +133,7 @@ Yandex, Google, Bing, GoogleLens 和 Tineye 等引擎经常会有机器人验证
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
 | `source` | string | 是 | - | 图片 URL (`http://...`) 或 Base64 字符串。 |
-| `engine` | string | 否 | **"Yandex"** | 搜索引擎名称。支持: Yandex, SauceNAO, Google, TraceMoe, Ascii2D, EHentai, Iqdb, BaiDu, Bing, GoogleLens, Tineye。 |
+| `engine` | string | 否 | 环境变量或 **"Yandex"** | 搜索引擎名称；支持 `All` 一次查询所有引擎。 |
 | `extra_params_json` | string | 否 | - | JSON 字符串，用于传递引擎特定的高级参数。 |
 | `limit` | int | 否 | 5 | 返回结果的最大数量。 |
 
@@ -136,9 +141,8 @@ Yandex, Google, Bing, GoogleLens 和 Tineye 等引擎经常会有机器人验证
 
 ```json
 {
-  "engine": "Ascii2D",
+  "engine": "All",
   "source": "https://example.com/image.jpg",
-  "extra_params_json": "{\"bovw\": true}",
   "limit": 3
 }
 ```
@@ -150,7 +154,7 @@ Yandex, Google, Bing, GoogleLens 和 Tineye 等引擎经常会有机器人验证
 **调用示例:**
 ```json
 {
-  "engine_name": "all" 
+  "engine_name": "All" 
 }
 ```
 或

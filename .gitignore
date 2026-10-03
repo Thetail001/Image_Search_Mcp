@@ -28,14 +28,32 @@ wheels/
 # PicImageSearch specific (if any local sources were kept, though we removed them)
 PicImageSearch/
 
+# 测试与覆盖率产物
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+report.xml
+
 # Local settings/testing
+#
+# 这几条以前没有开头的斜杠，于是会匹配**任何目录下**的同名文件：
+# 将来往 tests/ 里放一个 tests/test_logic.py，它会被静默忽略、永远提交不上，
+# 而本地跑起来一切正常 —— "只在本机存在"的测试是最难查的一类问题。
+# 锚定到仓库根之后，它们只匹配根目录下那几个历史遗留脚本。
 .env
-quick_test.py
-test_logic.py
-inspect_lib.py
-integration_test.py
-test_report.md
+/quick_test.py
+/test_logic.py
+/inspect_lib.py
+/integration_test.py
+/test_report.md
 
 # MCP/Project specific
 tmp/
 .gemini/
+
+# 反向测试与静态检查工具的临时产物
+.reverse-tests/
+.mypy_cache/
+.ruff_cache/

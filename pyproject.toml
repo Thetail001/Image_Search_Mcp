@@ -10,16 +10,54 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Thetail", email = "Thetailaaa@gmail.com"}
+]
+keywords = ["mcp", "reverse-image-search", "yandex", "saucenao", "tracemoe"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics",
 ]
 dependencies = [
-    "fastmcp",
-    "PicImageSearch",
-    "uvicorn"
+    # 故意**不**给上界：PicImageSearch 的 main 分支已经走到 httpx→httpx2
+    # 这种破坏性迁移，而 PyPI 上的 3.12.11 就是我们在用的版本。
+    # 上界解决不了"上游改了行为"这件事，只会让人以为锁住了。
+    # 真正的保护是 tests/ 里那套对着真实签名的契约测试 + CI 里跑一遍。
+    "fastmcp>=4.0",
+    "PicImageSearch>=3.12",
+    "uvicorn>=0.30",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    # 测试里必须有超时：一个每 50ms 吐 1 字节的响应能把测试永远挂住
+    # （实测踩过），CI 上表现为"卡住"而不是"失败"，比失败更难查。
+    "pytest-timeout>=2.3",
+]
+
+[project.urls]
+Repository = "https://github.com/Thetail001/Image_Search_Mcp"
+Issues = "https://github.com/Thetail001/Image_Search_Mcp/issues"
 
 [project.scripts]
 image-search-mcp = "image_search_mcp.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# 收集时先拒网：conftest 会给 httpx 注入"拒绝一切"的 transport，
+# 任何未经 mock 的出站请求都会立刻失败而不是真的打出去。
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    "error::DeprecationWarning:PicImageSearch.*",
+]

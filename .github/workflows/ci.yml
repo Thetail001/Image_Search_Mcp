@@ -1,0 +1,68 @@
+name: CI
+
+# 门禁在 CI 里跑的是**同一份** check.sh，不是另写一套命令 ——
+# 两套命令早晚会分叉，而分叉之后 CI 的绿灯就不再意味着本地能过。
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 测试（Python ${{ matrix.python-version }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 是 pyproject 里声明的下界。列在这里是为了让那句声明**被真的测过** ——
+        # 只写在元数据里而从不验证，和一个没写过的声明没有区别。
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安装（含开发依赖）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: 记录实际解析到的依赖版本
+        # 上游一变，这一行就是排查的第一个线索 —— 比"昨天还好好的"有用得多。
+        run: pip list
+
+      - name: 一键验收（跳过反向测试，反向测试单独一个 job）
+        run: ./check.sh --fast
+
+  reverse-tests:
+    name: 反向测试（门禁必须会红）
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装（含开发依赖）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: 把已修好的缺陷放回代码里，确认门禁会红
+        # 这一步是整套门禁的地基：没有它，上面的绿灯无法区分
+        # "代码是对的"和"测试没在看"。脚本会先确认导入到的是临时副本里的模块，
+        # 再要求指定测试**因断言失败**而红（退出码 1，不是收集错误 2/5）。
+        run: ./check.sh --reverse-only

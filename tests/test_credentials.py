@@ -86,8 +86,8 @@ def test_cookie_string_is_normalized_to_a_string():
 
 
 @pytest.mark.parametrize("bad,keyword", [
-    ("novalue", "不是 'name=value'"),
-    ("a=1; badsegment", "不是 'name=value'"),
+    ("novalue", "缺少值"),
+    ("a=1; badsegment", "缺少值"),
     ("", "空串"),
     ("   ", "空串"),
     ("a=1\nb=2", "换行"),
@@ -96,6 +96,49 @@ def test_bad_cookie_strings_are_rejected_with_actionable_message(bad: str, keywo
     with pytest.raises(CredentialError) as exc:
         normalize_cookie_string(bad, engine="Yandex")
     assert keyword in str(exc.value)
+
+
+@pytest.mark.parametrize("good", [
+    "sid=YWJjZA==",  # base64 值里的 '=' 合法：上游按**第一个** '=' 拆
+    "sid=a=b",
+    "sid=plain",
+    "sid=",
+    "a=1; b=2",
+])
+def test_cookie_values_may_contain_equals(good: str):
+    """含 ``=`` 的值必须接受，且**原样保留**（不只是"没抛异常"）。
+
+    旧校验是 ``^[^=;]+=[^=;]*$``，把值里的 ``=`` 一并禁掉 ——
+    base64 编码的凭据（``sid=YWJjZA==``）配上就被误拒，而 base64 是最常见的形态。
+    """
+    result = normalize_cookie_string(good, engine="Yandex")
+    for segment in (s.strip() for s in good.split(";")):
+        if segment:
+            assert segment in result
+
+
+def test_cookie_error_does_not_echo_credential_value():
+    """错误信息不得回显凭据值 —— 它会经 server 的错误出口返回给调用方。
+
+    旧实现把整段 ``segment!r`` 拼进消息，等于把 cookie 值写进对方的日志。
+    """
+    secret = "SUPER-SECRET-TOKEN-VALUE"
+    with pytest.raises(CredentialError) as exc:
+        normalize_cookie_string(f"bad name={secret}", engine="Yandex")
+    message = str(exc.value)
+    assert secret not in message
+    assert "第 1 个片段" in message  # 至少要能定位是哪个片段
+
+
+@pytest.mark.parametrize("bad", [
+    "bad name=x",      # 名称含空格（旧校验放行）
+    "sid=has\x00nul",  # 值含 NUL（旧校验放行）
+    "sid\x01=x",       # 名称含控制字符
+    "sid=café",        # 非 ASCII：到构造请求头时才炸，必须提前拒
+])
+def test_malformed_cookie_segments_are_rejected(bad: str):
+    with pytest.raises(CredentialError):
+        normalize_cookie_string(bad, engine="Yandex")
 
 
 def test_dict_input_is_rejected_explicitly():

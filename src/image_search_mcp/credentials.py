@@ -70,7 +70,14 @@ PROXY_VAR = "IMAGE_SEARCH_PROXY"
 #: 这些变量**不再被使用**，出现时给出提示
 IGNORED_PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
 
-_COOKIE_SEGMENT = re.compile(r"^[^=;]+=[^=;]*$")
+#: cookie 名称必须是 token 字符。
+#: 旧写法 ``^[^=;]+=[^=;]*$`` 一处错两个方向：名称那半允许空格与控制字符
+#: （``bad name=x`` 会被接受），值那半又禁掉 ``=``，而 base64/URL 编码的值里
+#: ``=`` 很常见（``sid=YWJjZA==`` 被误拒）。
+#: 上游按**第一个** ``=`` 拆（``PicImageSearch/network.py:51-54``），这里跟它对齐。
+_COOKIE_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+#: 值里禁止控制字符与片段分隔符 ``;``；``=`` 允许保留。
+_COOKIE_VALUE_FORBIDDEN = re.compile(r"[\x00-\x1f\x7f;]")
 
 
 class CredentialError(ValueError):
@@ -115,11 +122,30 @@ def normalize_cookie_string(raw: str, *, engine: str) -> str:
     if not segments:
         raise CredentialError(f"{engine} 的 cookies 是空串", hint="要么留空，要么写 'name=value'")
 
-    for segment in segments:
-        if not _COOKIE_SEGMENT.match(segment):
+    for index, segment in enumerate(segments, start=1):
+        name, sep, value = segment.partition("=")
+        # 错误信息只给**片段序号**，不回显片段内容：旧写法把整个 ``segment!r``
+        # 拼进消息，而它会经 server.py 的错误出口返回给调用方，
+        # 等于把凭据值写进对方日志（A 报告 A4）。
+        if not sep:
             raise CredentialError(
-                f"{engine} 的 cookies 片段 {segment!r} 不是 'name=value' 形式",
+                f"{engine} 的 cookies 第 {index} 个片段不带 '='，缺少值",
                 hint="格式为 'name=value; name2=value2'",
+            )
+        if not _COOKIE_NAME.match(name):
+            raise CredentialError(
+                f"{engine} 的 cookies 第 {index} 个片段的名称不合法",
+                hint="名称只能是 token 字符（字母、数字与 !#$%&'*+-.^_`|~）",
+            )
+        if not value.isascii():
+            raise CredentialError(
+                f"{engine} 的 cookies 第 {index} 个片段的值含非 ASCII 字符",
+                hint="值必须能原样放进请求头；需要就先用 base64 或 URL 编码",
+            )
+        if _COOKIE_VALUE_FORBIDDEN.search(value):
+            raise CredentialError(
+                f"{engine} 的 cookies 第 {index} 个片段的值含控制字符或 ';'",
+                hint="值里不要放控制字符或分号",
             )
 
     return "; ".join(segments)

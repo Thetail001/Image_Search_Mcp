@@ -109,10 +109,26 @@ def _unwrap_ipv4_mapped(addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | 
     return None
 
 
+#: stdlib 的 flag 表**没盖住**的特殊用途网段，必须显式判否。
+#: 为什么不能只信 ``is_global``：``fec0::/10``（已废弃的 IPv6 站点本地）在本机
+#: Python 3.11.16 上 ``is_global=True``，且 private / reserved 全为 False ——
+#: 所有 flag 都不拦，段首、段内、段尾实测全部放行。
+#: 本项目只要求 Python >=3.10，而这张表在小版本之间会变；安全判定不该跟着
+#: 解释器版本漂移，所以关键的拒绝在这里写死（`is_site_local` 与本表等价，
+#: 选显式网段是为了不依赖 flag 语义，也方便继续加同类的段）。
+_EXTRA_DENIED_NETWORKS: tuple[
+    ipaddress.IPv4Network | ipaddress.IPv6Network, ...
+] = (
+    ipaddress.ip_network("fec0::/10"),       # 已废弃的站点本地（RFC 3879）
+    ipaddress.ip_network("192.88.99.0/24"),  # 已废弃的 6to4 中继任播（RFC 7526）
+)
+
+
 def is_public_address(raw: str) -> bool:
     """该地址是否可安全访问。
 
-    拒绝：私网、回环、链路本地、多播、保留、未指定、以及 IPv4 映射/6to4 包装的私网地址。
+    拒绝：私网、回环、链路本地、多播、保留、未指定、IPv4 映射/6to4 包装的私网地址，
+    以及 :data:`_EXTRA_DENIED_NETWORKS` 里那些 stdlib flag 盖不住的特殊用途网段。
     允许：公网 IPv4 与公网 IPv6（**不能把"覆盖 IPv6"实现成"一律拒绝 IPv6"**）。
     """
     try:
@@ -124,6 +140,10 @@ def is_public_address(raw: str) -> bool:
         mapped = _unwrap_ipv4_mapped(addr)
         if mapped is not None:
             return is_public_address(str(mapped))
+
+    # 跨版本稳定的显式拒绝，放在 flag 之前判
+    if any(addr in net for net in _EXTRA_DENIED_NETWORKS):
+        return False
 
     # is_global 在部分 Python 版本对某些保留段判定不一致，逐项显式判否更稳
     if (
@@ -296,7 +316,27 @@ class SafeDownloader:
         self._proxy = None
 
     async def fetch(self, url: str) -> bytes:
-        deadline = time.monotonic() + self.policy.total_timeout
+        """取回图片字节。
+
+        **整条调用受一个绝对期限约束**：DNS 解析、每一跳的连接与响应头、读取循环、
+        以及失败后的清理，都必须在 ``policy.total_timeout`` 内结束。
+
+        之前这里只把 deadline 的**数值**往下传、在"每跳开始"和"收到 body chunk"处比较
+        —— 那盖不住裸 await：resolver 卡住时协程会一直挂着，下载器自己不报 timeout
+        （实测：30 ms 期限配一个阻塞的 resolver，只有外层 ``wait_for`` 能停住它）。
+        所以在外层再包一层 ``wait_for`` —— 这是唯一能把"正在等待的裸 await"
+        也纳入期限的办法。
+
+        不用 ``asyncio.timeout``：那是 3.11+ 才有的，而 pyproject 声明支持 3.10。
+        """
+        budget = self.policy.total_timeout
+        try:
+            return await asyncio.wait_for(self._fetch_hops(url, budget), budget)
+        except asyncio.TimeoutError as exc:
+            raise DownloadError("timeout", "下载总期限已到", url=url) from exc
+
+    async def _fetch_hops(self, url: str, budget: float) -> bytes:
+        deadline = time.monotonic() + budget
         current = url
         visited: list[str] = []
 
@@ -391,6 +431,9 @@ class SafeDownloader:
             "Host": target.host_header,
             "User-Agent": self.policy.user_agent,
             "Accept": "*/*",
+            # 明确要**未压缩**的字节。图片本身已是压缩格式，再叠一层内容编码
+            # 只会把"先解压再计数"变成一条内存放大路径（见 _read_bounded 的说明）。
+            "Accept-Encoding": "identity",
         }
         extensions = {}
         if target.scheme == "https":
@@ -432,7 +475,23 @@ class SafeDownloader:
                     except ValueError:
                         pass
 
-                body = await self._read_bounded(response, target, deadline)
+                encoding = (response.headers.get("content-encoding") or "").strip().lower()
+                if encoding and encoding != "identity":
+                    # 光发 ``Accept-Encoding: identity`` 不够 —— 服务端可以不遵守。
+                    # 一旦是 gzip/deflate，httpx 会在 yield 出第一个 chunk **之前**就把
+                    # 整个 body 解出来（``_models.py`` 是先 decode 再 yield，而
+                    # ``_decoders.py`` 的 gzip 解压没有输出长度上限）。
+                    # 实测：32 MiB 数据压成 32 KB，预算设 1 MiB —— 最终确实报 too_large，
+                    # 但此前 Python 分配峰值已到 77.41 MiB，防护发生得太晚。
+                    # 所以在读之前就拒掉，并把原因说清楚，便于排查是站点行为还是配置问题。
+                    raise DownloadError(
+                        "unsupported_content_encoding",
+                        f"目标以 Content-Encoding: {encoding} 压缩响应，"
+                        f"拒绝在计数之前解压",
+                        url=target.display,
+                    )
+
+                body = await self._read_bounded(response, target)
                 return status, None, body
         finally:
             # 超限、超时、取消都要关掉 client —— 不留挂起连接
@@ -442,27 +501,24 @@ class SafeDownloader:
         self,
         response: httpx.Response,
         target: Target,
-        deadline: float,
     ) -> bytes:
-        """流式读取，超限立即停止消费，超过总期限同样终止。
+        """流式读取，**只**负责大小上限；期限由 ``fetch`` 的绝对期限统一负责。
 
-        两件事必须都在这一层做：
+        为什么期限不在这里再查一遍：这里查的是``同一个预算``（``total_timeout``）
+        对着``同一个起点``，而且只能在"收到下一个 chunk"之后才轮到它 ——
+        外层那个绝对期限永远先到或同时到。两处检查互相遮挡的直接后果是
+        **反向测试失效**：把循环里那段删掉，慢速滴流仍然被外层拦下，指定测试
+        照样通过，于是这条门禁变成了摆设（实测踩到）。宁可只留一个机制。
 
-        - **计的是解码后的字节数**（``aiter_bytes``），所以压缩炸弹不能靠
-          "压缩后很小"绕过预算。
-        - **总期限要在读取循环里检查**。只靠 httpx 的 read timeout 是不够的：
-          一个每 50ms 吐 1 字节、总量永不超限的响应，每次读取都在超时内成功，
-          连接可以永远挂着 —— 实测就是这样把测试跑挂的。
+        - **计的是解码后的字节数**（``aiter_bytes``）。但这**不等于内存受控** ——
+          httpx 先把 raw 解压、再 yield 出来，解压发生在本函数的计数**之前**，
+          所以"已经分配过一大块之后才报超限"是可能的。
+          真正的防线在 ``_request_pinned``：读之前就拒绝非 identity 的
+          ``Content-Encoding``。
         """
         chunks: list[bytes] = []
         total = 0
         async for chunk in response.aiter_bytes():
-            if time.monotonic() >= deadline:
-                raise DownloadError(
-                    "timeout",
-                    f"下载超过总期限 {self.policy.total_timeout}s（已读取 {total} 字节）",
-                    url=target.display,
-                )
             total += len(chunk)
             if total > self.policy.max_bytes:
                 # 立刻停手：不再 aiter 下去，让连接被关掉

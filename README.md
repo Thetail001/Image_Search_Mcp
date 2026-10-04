@@ -8,7 +8,7 @@
 
 - **多引擎支持**：集成 11 种主流搜图引擎 (Yandex, SauceNAO, Google, TraceMoe, ASCII2D, EHentai, Iqdb, BaiDu, Bing, GoogleLens, Tineye)。
 - **结果精简**：自动移除原始冗余数据，仅返回最关键的标题、链接、缩略图等信息。
-- **智能提示**：当因机器人验证（Bot Protection）导致无结果时，自动提示配置 Cookie。
+- **空结果提示**：没匹配到结果时给出**排查顺序**（图本身、覆盖范围、限流、是否需要凭据），不替上游断定"是机器人验证"。
 - **零配置部署**：通过 `uvx` 直接运行。
 - **安全配置**：API Key 和代理设置通过环境变量管理。
 - **灵活输入**：支持图片 URL 和 Base64 编码。
@@ -111,7 +111,21 @@ uvx image-search-mcp --sse --host 0.0.0.0 --port 8000
 > 归属不明时宁可拒绝，也不猜一个引擎发出去（猜错就是把 A 站凭据发给 B 站）。
 
 ### 关于 Cookies 的重要提示
-Yandex, Google, Bing, GoogleLens 和 Tineye 等引擎经常会有机器人验证（CAPTCHA）。如果搜索返回 "No results found" 或提示 Bot Protection，请尝试在浏览器中访问对应搜索引擎，登录并获取 Cookies，然后设置到**对应引擎的** `IMAGE_SEARCH_COOKIES_<引擎>` 环境变量中（例如 `IMAGE_SEARCH_COOKIES_YANDEX`）。
+
+有些引擎（Yandex、Google、Bing、GoogleLens、Tineye 等）确实可能要求凭据，但
+**"No results found." 不等于机器人验证** —— 服务也不会这样断言（旧文案这么写过，是猜的）。
+没结果时按这个顺序排查：
+
+1. **先看有没有明确失败信息**。上游明确报错时会返回 `Error: …`（`isError=true`），
+   那是可判定的事实，照它修；只有 "No results found." 才是"搜索成功、上游没报错、就是没匹配"。
+2. **图本身**：太小、太模糊、被裁过，任何引擎都匹配不到。
+3. **覆盖范围**：收录这张图的站点不在该引擎的索引里。
+4. **限流 / 需要凭据**：到这一步再考虑配 cookies —— 在浏览器里登录对应搜索引擎，
+   拿到 cookies 后设到**对应引擎的** `IMAGE_SEARCH_COOKIES_<引擎>`（例如 `IMAGE_SEARCH_COOKIES_YANDEX`）。
+
+配 cookie **不保证**能绕过风控。Bing 尤其要注意：它在本项目里标为 `experimental`，
+原因是上游 PyPI 3.12.11 **缺少签名解密修复**（该修复尚未发版），空结果可能与之有关 ——
+这种情况配 cookie 也不会改善。
 
 每个引擎的 cookie 只会发给它自己真正访问的域名（Yandex → `yandex.com`，EHentai → `e-hentai.org` / `exhentai.org`，依此类推）。这张域名表对着上游源码核验过，并有测试盯着。
 

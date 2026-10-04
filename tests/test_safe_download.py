@@ -67,6 +67,40 @@ def _downloader(recorder: _Recorder, hosts: dict[str, list[str]], **policy_kw):
 
 
 # ==========================================================================
+# 期限：两层机制都要留着
+# ==========================================================================
+
+
+class _BurstStream(httpx.AsyncByteStream):
+    """不停吐 chunk 的流：只 yield 已有数据，不 await 任何会阻塞的东西。"""
+
+    async def __aiter__(self):
+        for _ in range(4):
+            yield b"x" * 8
+
+
+async def test_read_bounded_checks_the_deadline_itself():
+    """内层必须自己查期限 —— 外层 ``wait_for`` 不总能先到。
+
+    复核报告实测：20 ms 期限配一个忙转的流，实际跑到 135 ms（取消只能投递到
+    await 点）。所以这条**绕过外层**直接调 ``_read_bounded``，并且给一个
+    **已经过期**的期限：只有内层的检查能把这次读变成 timeout。
+    把内层那段删掉，这条就会红 —— 这正是它作为门禁的意义。
+
+    只留内层同样不行（卡在裸 await 上时轮不到它），那一半由
+    ``test_resolver_that_never_returns_hits_the_deadline`` 守着。
+    """
+    downloader = _downloader(_Recorder(), {"a.example.com": ["93.184.216.34"]})
+    target = parse_target("https://a.example.com/img.png", downloader.policy)
+    response = httpx.Response(200, stream=_BurstStream())
+
+    with pytest.raises(DownloadError) as caught:
+        await downloader._read_bounded(response, target, time.monotonic() - 1.0)
+
+    assert caught.value.reason == "timeout"
+
+
+# ==========================================================================
 # 契约：哪些引擎会在本地抓图
 # ==========================================================================
 

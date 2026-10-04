@@ -542,7 +542,7 @@ class SafeDownloader:
                         url=target.display,
                     )
 
-                body = await self._read_bounded(response, target)
+                body = await self._read_bounded(response, target, deadline)
                 return status, None, body
         finally:
             # 超限、超时、取消都要关掉 client —— 不留挂起连接
@@ -552,14 +552,16 @@ class SafeDownloader:
         self,
         response: httpx.Response,
         target: Target,
+        deadline: float,
     ) -> bytes:
-        """流式读取，**只**负责大小上限；期限由 ``fetch`` 的绝对期限统一负责。
+        """流式读取：大小上限**和**期限都在这里自己查。
 
-        为什么期限不在这里再查一遍：这里查的是``同一个预算``（``total_timeout``）
-        对着``同一个起点``，而且只能在"收到下一个 chunk"之后才轮到它 ——
-        外层那个绝对期限永远先到或同时到。两处检查互相遮挡的直接后果是
-        **反向测试失效**：把循环里那段删掉，慢速滴流仍然被外层拦下，指定测试
-        照样通过，于是这条门禁变成了摆设（实测踩到）。宁可只留一个机制。
+        **两层都要留**，这是实测结论（我先前删过内层，被复核用实测驳回了）：
+        外层 ``wait_for`` 是唯一能停住"正在等的裸 await"（例如卡在 resolver 线程里）
+        的手段，但它投递取消只能落在 await 点上 —— 20 ms 期限配一个忙转的流，
+        实测跑到了 135 ms。内层这个检查不依赖取消，每收到一个 chunk 比一次绝对期限，
+        负责把"数据还在稳定到达、但总时限已经过了"当场截停。
+        反过来只留内层也不行：卡在裸 await 上时根本轮不到它。
 
         - **计的是解码后的字节数**（``aiter_bytes``）。但这**不等于内存受控** ——
           httpx 先把 raw 解压、再 yield 出来，解压发生在本函数的计数**之前**，
@@ -570,6 +572,8 @@ class SafeDownloader:
         chunks: list[bytes] = []
         total = 0
         async for chunk in response.aiter_bytes():
+            if time.monotonic() > deadline:
+                raise DownloadError("timeout", "下载总期限已到", url=target.display)
             total += len(chunk)
             if total > self.policy.max_bytes:
                 # 立刻停手：不再 aiter 下去，让连接被关掉

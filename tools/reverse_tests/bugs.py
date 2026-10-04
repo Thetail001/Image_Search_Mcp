@@ -110,30 +110,6 @@ INJECTIONS: tuple[BugInjection, ...] = (
         ),
         why="凭据外发：无域 cookie 会跟着请求发往任何域名（实测过 sid 发给 untrusted.invalid）",
     ),
-    BugInjection(
-        name="download-total-deadline-removed",
-        path="src/image_search_mcp/safe_download.py",
-        old=(
-            "        budget = self.policy.total_timeout\n"
-            "        try:\n"
-            "            return await asyncio.wait_for(self._fetch_hops(url, budget), budget)\n"
-            "        except asyncio.TimeoutError as exc:\n"
-            '            raise DownloadError("timeout", "下载总期限已到", url=url) from exc'
-        ),
-        new=(
-            "        budget = self.policy.total_timeout\n"
-            "        # 注入：去掉绝对期限\n"
-            "        return await self._fetch_hops(url, budget)"
-        ),
-        test=(
-            "tests/test_safe_download.py"
-            "::test_slow_trickle_is_stopped_by_total_deadline"
-        ),
-        why="慢速下载拖死连接：没有绝对期限时，一个总量合法、永远发不完的响应"
-            "会让连接一直挂着。注意这条与 download-deadline-not-wrapping-bare-awaits "
-            "注入的是**同一处**代码 —— 一个机制由两条独立测试盯着（滴流、卡住的 resolver），"
-            "两条都必须会红",
-    ),
     # ---------------------------------------------------------------- 批次 1-5
     BugInjection(
         name="start-without-token",
@@ -201,8 +177,16 @@ INJECTIONS: tuple[BugInjection, ...] = (
             "tests/test_safe_download.py"
             "::test_resolver_that_never_returns_hits_the_deadline"
         ),
-        why="期限盖不住裸 await：只在「每跳开始」和「收到 chunk」处比较，"
-            "resolver 卡住时两个检查点都到不了，协程永远挂着、自己不报 timeout",
+        why=(
+            "期限盖不住裸 await：只在「每跳开始」和「收到 chunk」处比较，"
+            "resolver 卡住时两个检查点都到不了，协程永远挂着、自己不报 timeout。"
+            "**只有这条测试能区分外层机制** —— 另有一条注入（原名 "
+            "download-total-deadline-removed）改的是同一处代码、却指给「慢速滴流」那条测试；"
+            "内层期限检查恢复后，滴流会被内层截停，那条注入就再也区分不出外层了"
+            "（实测：注入之后滴流测试仍然通过）。两条注入改的既然是同一处，"
+            "就合并成这一条，外层由卡住的 resolver 盯，滴流/内层由 "
+            "read-bounded-deadline-check-removed 盯 —— 两个机制各有一条能区分它的测试。"
+        ),
     ),
     BugInjection(
         name="content-encoding-rejection-removed",
@@ -623,6 +607,24 @@ INJECTIONS: tuple[BugInjection, ...] = (
         why=(
             "重复 Authorization 头由头顺序决定放行：dict() 是后者覆盖前者，"
             "实测「无效在前、有效在后」→ 204 放行（复核报告第 12 问）"
+        ),
+    ),
+    # ---------------------------------------------------------------- 复核 P1
+    BugInjection(
+        name="read-bounded-deadline-check-removed",
+        path="src/image_search_mcp/safe_download.py",
+        old=(
+            "            if time.monotonic() > deadline:\n"
+            '                raise DownloadError("timeout", "下载总期限已到", url=target.display)\n'
+        ),
+        new="            # 注入：内层期限检查被去掉\n",
+        test=(
+            "tests/test_safe_download.py"
+            "::test_read_bounded_checks_the_deadline_itself"
+        ),
+        why=(
+            "内层期限检查被删掉：忙转的流能远超总期限才被外层 wait_for 截停"
+            "（复核实测 20 ms 预算跑了 135 ms）。我先前以为两层互相遮挡就删了它，删错了"
         ),
     ),
 )

@@ -59,6 +59,8 @@ from .credentials import (
     install_cookie_jar,
     load_engine_credentials,
     load_proxy,
+    strip_inherited_proxies,
+    PROXY_VAR,
 )
 from .safe_download import (
     ENGINES_THAT_FETCH_LOCALLY,
@@ -421,7 +423,7 @@ async def _run_search(
 
     # 3. 凭据与出站配置
     credentials = load_engine_credentials(engine)
-    network_kwargs, _ = _build_network_kwargs()
+    network_kwargs, explicit_proxy = _build_network_kwargs()
 
     # SauceNAO 的 api_key 只从环境取，不接受调用方传入
     if engine == "SauceNAO":
@@ -434,6 +436,18 @@ async def _run_search(
     engine_cls = ENGINES[engine]
 
     async with Network(**network_kwargs) as net:
+        # httpx 默认 trust_env=True，而且在**构造时**就把环境里的代理挂进了 _mounts，
+        # 事后改 trust_env 是无效的（见 credentials.strip_inherited_proxies 的说明）。
+        # 不拆掉的话，"环境代理不生效"这个承诺是空的 —— 带凭据的请求会走一个
+        # 不知从哪来的代理（复核报告 B5）。
+        dropped = strip_inherited_proxies(net, explicit_proxy=explicit_proxy is not None)
+        if dropped:
+            logger.warning(
+                "已拆掉从环境继承的代理挂载 %s：本服务只认显式的 %s",
+                ", ".join(dropped),
+                PROXY_VAR,
+            )
+
         if credentials is not None:
             # 装**域限定**的 jar：只发给该引擎真正访问的域名。
             # Network 接不了 Cookies 对象，所以装到它交出的真实 client 上。

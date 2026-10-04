@@ -88,8 +88,14 @@ INJECTIONS: tuple[BugInjection, ...] = (
     BugInjection(
         name="cookie-domain-scope-removed",
         path="src/image_search_mcp/credentials.py",
-        old='            jar.set(name.strip(), value.strip(), domain=domain, path="/")',
-        new="            jar.set(name.strip(), value.strip())  # 注入：去掉域限定",
+        old=(
+            "                    domain=domain,\n"
+            "                    domain_specified=True,"
+        ),
+        new=(
+            '                    domain="",  # 注入：去掉域限定\n'
+            "                    domain_specified=False,"
+        ),
         test=(
             "tests/test_credentials.py"
             "::test_scoped_jar_only_sends_to_the_engine_domain"
@@ -256,6 +262,162 @@ INJECTIONS: tuple[BugInjection, ...] = (
         new="        if False:  # 注入：值里的控制字符不再检查",
         test="tests/test_credentials.py::test_malformed_cookie_segments_are_rejected",
         why="过宽：旧校验放行名称里的空格与值里的 NUL，会污染实际发出去的请求头",
+    ),
+    # ------------------------------------------- 复核报告 B1：URL 规范化与原因归类
+    BugInjection(
+        name="ipv6-authority-brackets-dropped",
+        path="src/image_search_mcp/safe_download.py",
+        old='        host = f"[{self.host}]" if ":" in self.host else self.host',
+        new="        host = self.host",
+        test=(
+            "tests/test_url_and_reason_contract.py"
+            "::test_ipv6_literal_keeps_brackets_in_authority"
+        ),
+        why="去掉方括号后 Host 头成了『2606:4700::1111:8443』，下一跳重新解析时直接坏掉",
+    ),
+    BugInjection(
+        name="url-parse-valueerror-unwrapped",
+        path="src/image_search_mcp/safe_download.py",
+        old=(
+            "    try:\n"
+            "        parts = urlsplit(url.strip())\n"
+            '        scheme = (parts.scheme or "").lower()\n'
+            "        hostname = parts.hostname\n"
+            "        port = parts.port\n"
+            "    except ValueError as exc:\n"
+            '        raise DownloadError("invalid_url", f"URL 无法解析：{exc}", url=url) from exc'
+        ),
+        new=(
+            "    parts = urlsplit(url.strip())\n"
+            '    scheme = (parts.scheme or "").lower()\n'
+            "    hostname = parts.hostname\n"
+            "    port = parts.port"
+        ),
+        test=(
+            "tests/test_url_and_reason_contract.py"
+            "::test_malformed_urls_are_invalid_url_not_bare_valueerror"
+        ),
+        why="非法端口与不配对方括号会漏出裸 ValueError，调用方分不清是谁的错",
+    ),
+    BugInjection(
+        name="idna-encoding-removed",
+        path="src/image_search_mcp/safe_download.py",
+        old=(
+            '    bare_host = hostname.rstrip(".")\n'
+            "    try:\n"
+            '        ipaddress.ip_address(bare_host.split("%")[0])  # 字面量地址：原样保留\n'
+            "        host = bare_host\n"
+            "    except ValueError:\n"
+            "        try:\n"
+            '            host = bare_host.encode("idna").decode("ascii")\n'
+            "        except (UnicodeError, ValueError) as exc:\n"
+            "            raise DownloadError(\n"
+            '                "invalid_url", f"主机名无法转为 IDNA：{exc}", url=url\n'
+            "            ) from exc"
+        ),
+        new='    host = hostname.rstrip(".")',
+        test=(
+            "tests/test_url_and_reason_contract.py::test_non_ascii_host_is_idna_encoded"
+        ),
+        why="中文主机名会被原样放进 Host 头，直到构造请求时才抛 UnicodeEncodeError",
+    ),
+    BugInjection(
+        name="http-status-check-after-size-budget",
+        path="src/image_search_mcp/safe_download.py",
+        old=(
+            "                if status >= 400:\n"
+            "                    # 在**读 body 之前**判定。先读完再报的话，一个大 body 的错误页\n"
+            "                    # 会被归成 too_large（复核报告 B1 实测：503 带超限 Content-Length\n"
+            "                    # 报的是 too_large 而不是 http_error），而且白下载一遍。\n"
+            "                    raise DownloadError(\n"
+            '                        "http_error", f"目标返回 HTTP {status}", url=target.display\n'
+            "                    )\n"
+            "\n"
+        ),
+        new="",
+        test=(
+            "tests/test_url_and_reason_contract.py"
+            "::test_http_error_is_decided_before_the_size_budget"
+        ),
+        why="先按体积判、再按状态判：大 body 的错误页会被报成 too_large，还白下载一遍",
+    ),
+    BugInjection(
+        name="read-timeout-lumped-into-connection-failed",
+        path="src/image_search_mcp/safe_download.py",
+        old=(
+            "            except httpx.TimeoutException as exc:\n"
+            '                # 单次 I/O 超时与"连不上"对排查的含义完全不同：\n'
+            "                # 过去 ReadTimeout 也被归成 connection_failed（复核报告 B1）\n"
+            "                last_error = exc\n"
+            "                timed_out = True\n"
+            "                continue\n"
+        ),
+        new="",
+        test=(
+            "tests/test_url_and_reason_contract.py"
+            "::test_read_timeout_is_classified_as_timeout_not_connection_failed"
+        ),
+        why="ReadTimeout 落进连接失败分支后，排查时会把『对端慢』看成『连不上』",
+    ),
+    BugInjection(
+        name="initial-url-not-marked-visited",
+        path="src/image_search_mcp/safe_download.py",
+        old=(
+            "            target = parse_target(current, self.policy)\n"
+            "            # 把**当前**这一跳记进 visited。不记的话，一个指回起点的重定向\n"
+            "            # 要等到再发一次请求之后才被发现（复核报告 B1）。\n"
+            "            if target.display not in visited:\n"
+            "                visited.append(target.display)\n"
+        ),
+        new="            target = parse_target(current, self.policy)\n",
+        test=(
+            "tests/test_url_and_reason_contract.py"
+            "::test_redirect_to_itself_is_detected_without_a_second_request"
+        ),
+        why="起点不在 visited 里，自环要多发一次请求才被发现",
+    ),
+    # ------------------------------------------- 复核报告 B4/B5/B6
+    BugInjection(
+        name="cookie-secure-flag-off",
+        path="src/image_search_mcp/credentials.py",
+        old="                    secure=True,",
+        new="                    secure=False,  # 注入：secure 标志关掉",
+        test="tests/test_credentials.py::test_cookie_jar_only_sends_over_https",
+        why="secure=False 时明文 http:// 也会带上凭据（Cookies.set 的默认行为）",
+    ),
+    BugInjection(
+        name="env-proxy-mounts-not-stripped",
+        path="src/image_search_mcp/credentials.py",
+        old=(
+            '    mounts = getattr(client, "_mounts", None)\n'
+            "    if not mounts:\n"
+            "        return ()\n"
+            "\n"
+            "    removed: list[str] = []\n"
+            "    for key in list(mounts):\n"
+            "        if mounts[key] is None:\n"
+            "            continue\n"
+            "        del mounts[key]\n"
+            '        removed.append(getattr(key, "pattern", str(key)))\n'
+            "    return tuple(removed)"
+        ),
+        new="    return ()  # 注入：不再拆继承来的代理挂载",
+        test=(
+            "tests/test_credentials.py"
+            "::test_inherited_env_proxy_mounts_are_removed"
+        ),
+        why="httpx 在构造时就把环境代理挂进 _mounts，不拆的话带凭据的请求会走它",
+    ),
+    BugInjection(
+        name="domain-table-missing-entry",
+        path="src/image_search_mcp/credentials.py",
+        old='    "Google": ("google.com", "google.co.jp"),',
+        new='    "Google": ("google.com",),',
+        test=(
+            "tests/test_credentials.py"
+            "::test_every_upstream_host_is_declared_or_explicitly_excused"
+        ),
+        why="域表少一项时凭据发不出去（功能坏但没人知道）；单向核验发现不了这个",
     ),
 )
 

@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from http.cookiejar import Cookie
 from typing import Mapping
 from urllib.parse import urlparse
 
@@ -152,10 +153,16 @@ def normalize_cookie_string(raw: str, *, engine: str) -> str:
 
 
 def build_cookie_jar(cookie_string: str, *, domains: tuple[str, ...]) -> httpx.Cookies:
-    """构造**限域**的 cookie jar。
+    """构造**限域且仅 HTTPS** 的 cookie jar。
 
-    用 ``httpx.Cookies().set(..., domain=...)`` 而不是 ``cookies={...}`` ——
-    后者产生的 cookie 没有域，会跟着请求发往任何域名。
+    这两个都不是默认行为，必须显式做：
+
+    1. **限域**：用 ``httpx.Cookies().set(..., domain=...)`` 而不是 ``cookies={...}`` ——
+       后者产生的 cookie 没有域，会跟着请求发往任何域名。
+    2. **仅 HTTPS**：``Cookies.set()`` 内部构造的 ``Cookie`` 是 ``secure=False``，
+       也就是 ``http://yandex.com/`` 这个明文地址也会带上凭据（复核报告 B4，已实测）。
+       ``Cookies.set()`` **没有** secure 参数，所以这里直接建 ``http.cookiejar.Cookie``
+       把 ``secure`` 打开。代价是引擎若走 http:// 就拿不到 cookie —— 这正是想要的结果。
     """
     jar = httpx.Cookies()
     for segment in cookie_string.split(";"):
@@ -164,8 +171,68 @@ def build_cookie_jar(cookie_string: str, *, domains: tuple[str, ...]) -> httpx.C
             continue
         name, _, value = segment.partition("=")
         for domain in domains:
-            jar.set(name.strip(), value.strip(), domain=domain, path="/")
+            jar.jar.set_cookie(
+                Cookie(
+                    version=0,
+                    name=name.strip(),
+                    value=value.strip(),
+                    port=None,
+                    port_specified=False,
+                    domain=domain,
+                    domain_specified=True,
+                    domain_initial_dot=False,
+                    path="/",
+                    path_specified=True,
+                    secure=True,
+                    expires=None,
+                    discard=True,
+                    comment=None,
+                    comment_url=None,
+                    rest={},
+                    rfc2109=False,
+                )
+            )
     return jar
+
+
+def strip_inherited_proxies(
+    client: httpx.AsyncClient,
+    *,
+    explicit_proxy: bool = False,
+) -> tuple[str, ...]:
+    """拆掉 httpx **构造时从环境变量继承**来的代理挂载，返回被拆掉的 pattern。
+
+    == 为什么不能靠 trust_env ==
+
+    ``trust_env`` 是**构造参数**。httpx 在 ``AsyncClient.__init__`` 里就把
+    ``get_environment_proxies()`` 编译成 URLPattern 挂进 ``_mounts``
+    （``httpx/_client.py:242-249``），而 ``_transport_for_url`` 之后**只看** ``_mounts``
+    （同文件 760-769）。所以在别人构造好的 client 上再改 ``_trust_env`` 是无效的 ——
+    这样一来"环境代理不生效"这个承诺在端到端上原本是空的：带凭据的引擎请求会
+    悄悄走一个不知从哪来的代理（复核报告 B5）。
+
+    == 为什么判定依据是"我们自己配没配代理" ==
+
+    不能靠"看到 mount 就拆"：显式 ``proxy=`` 也会挂出形状完全一样的 ``all://`` mount，
+    两者在对象上看不出区别。唯一可靠的依据是我们自己的配置：
+    只有**没有**配 ``IMAGE_SEARCH_PROXY`` 时，client 上的代理才只可能来自环境。
+
+    ``value 为 None`` 的 mount 不是代理，它表示"用默认 transport"，不动它。
+    """
+    if explicit_proxy:
+        return ()
+
+    mounts = getattr(client, "_mounts", None)
+    if not mounts:
+        return ()
+
+    removed: list[str] = []
+    for key in list(mounts):
+        if mounts[key] is None:
+            continue
+        del mounts[key]
+        removed.append(getattr(key, "pattern", str(key)))
+    return tuple(removed)
 
 
 def cookie_domains_for(engine: str) -> tuple[str, ...]:

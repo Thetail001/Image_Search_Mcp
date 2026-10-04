@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 
 import httpx
 import pytest
@@ -30,6 +31,7 @@ from image_search_mcp.credentials import (
     load_engine_credentials,
     load_proxy,
     normalize_cookie_string,
+    strip_inherited_proxies,
 )
 
 ENGINE_MODULES = {
@@ -308,3 +310,144 @@ def test_network_rejects_a_cookies_object():
     """
     with pytest.raises(AttributeError, match="split"):
         Network(cookies=build_cookie_jar("sid=1", domains=("yandex.com",)))  # type: ignore[arg-type]
+
+
+# ==========================================================================
+# 域表的**反向**核验：少一个域也要红
+# ==========================================================================
+
+_HOST_IN_SOURCE = re.compile(r"https?://([A-Za-z0-9._-]+)")
+
+#: 上游会访问、但**明确不该收到引擎凭据**的主机。
+#: 每加一项就少一道"凭据发错地方"的护栏，所以必须写清理由。
+HOSTS_THAT_NEED_NO_CREDENTIALS = {
+    # GoogleLens 的第三方搜索 API：它有自己的 API key，与 Google 账号 cookie 无关。
+    # 把 Google 的 cookie 发给它属于凭据外发。
+    "www.searchapi.io",
+}
+
+
+@pytest.mark.parametrize("engine", sorted(COOKIE_DOMAINS))
+def test_every_upstream_host_is_declared_or_explicitly_excused(engine: str) -> None:
+    """源码里出现的每个主机都必须有归属。
+
+    只验"表里的域在源码里存在"是**单向**的：那样从表里**删掉**一个域
+    （比如 Google 的 google.co.jp）测试照样通过，而那批凭据就再也发不出去了
+    —— 功能坏了却没人知道（复核报告 B6）。这里把方向反过来。
+    """
+    source = inspect.getsource(
+        __import__(f"PicImageSearch.engines.{ENGINE_MODULES[engine]}", fromlist=["_"])
+    )
+    hosts = {match.group(1) for match in _HOST_IN_SOURCE.finditer(source)}
+    declared = COOKIE_DOMAINS[engine]
+
+    undeclared = sorted(
+        host
+        for host in hosts
+        if host not in HOSTS_THAT_NEED_NO_CREDENTIALS
+        and not any(host == domain or host.endswith("." + domain) for domain in declared)
+    )
+
+    assert not undeclared, (
+        f"{engine} 的上游源码访问了 {undeclared}，但凭据域名表里既没有它们，"
+        f"也没在 HOSTS_THAT_NEED_NO_CREDENTIALS 里给出理由。"
+        f"少一个域等于那个站点的凭据发不出去。"
+    )
+
+
+# ==========================================================================
+# B4：凭据只在 HTTPS 上发送
+# ==========================================================================
+
+def test_cookie_jar_only_sends_over_https() -> None:
+    """凭据不能跟着明文 ``http://`` 走。
+
+    ``Cookies.set()`` 内部造出的 ``Cookie`` 是 ``secure=False``，于是
+    ``http://yandex.com/`` 这个明文地址也会带上 cookie（复核报告 B4，已实测）。
+    """
+    jar = build_cookie_jar("sid=SECRET", domains=("yandex.com",))
+
+    over_http = httpx.Request("GET", "http://yandex.com/a", cookies=jar)
+    over_https = httpx.Request("GET", "https://yandex.com/a", cookies=jar)
+
+    assert over_http.headers.get("cookie") is None, "明文请求不能带凭据"
+    assert over_https.headers.get("cookie") == "sid=SECRET", "HTTPS 必须带上"
+
+
+def test_cookie_jar_entries_are_marked_secure() -> None:
+    jar = build_cookie_jar("sid=SECRET", domains=("yandex.com",))
+
+    cookies = list(jar.jar)
+    assert cookies, "jar 不该是空的"
+    assert all(cookie.secure for cookie in cookies)
+
+
+def test_default_cookie_object_is_not_secure_which_is_why_we_build_our_own() -> None:
+    """反向证据：``Cookies.set()`` 的默认行为就是会跟着 ``http://`` 走。
+
+    这条是"为什么不用 ``Cookies.set()``"的现场证据 —— 它也说明
+    "把地址校验做成 https-only"这件事光靠调用方自觉是不够的。
+    """
+    default = httpx.Cookies()
+    default.set("sid", "X", domain="yandex.com")
+
+    over_http = httpx.Request("GET", "http://yandex.com/a", cookies=default)
+
+    assert over_http.headers.get("cookie") == "sid=X"
+
+
+# ==========================================================================
+# B5：环境代理必须**真的**不生效
+# ==========================================================================
+
+def _proxy_mounts(client: httpx.AsyncClient) -> set[str]:
+    mounts = getattr(client, "_mounts", {})
+    return {getattr(key, "pattern", str(key)) for key, value in mounts.items() if value is not None}
+
+
+async def test_inherited_env_proxy_mounts_are_removed(monkeypatch, real_client_init) -> None:
+    """必须用**真实 client** 来验。
+
+    默认夹具会给 client 注入 transport，而 httpx 一旦拿到 transport 就**不读**环境代理
+    （``allow_env_proxies = trust_env and transport is None``），所以那种写法
+    把实现改回 ``trust_env=True`` 也照样通过 —— 就是复核报告 B6 说的假测试。
+    这里用 ``real_client_init`` 拿到真实构造路径。
+    """
+    monkeypatch.setenv("HTTPS_PROXY", "http://192.0.2.1:3128")
+
+    async with httpx.AsyncClient() as client:
+        assert _proxy_mounts(client), "前提：httpx 确实先把环境代理挂上了"
+
+        dropped = strip_inherited_proxies(client, explicit_proxy=False)
+
+        assert dropped, "应当报出被拆掉的 pattern"
+        assert not _proxy_mounts(client), "拆完之后不能再有代理挂载"
+
+
+async def test_explicit_proxy_mounts_are_left_alone(real_client_init) -> None:
+    """显式配的代理不能被拆。
+
+    两种 mount 在对象上长得**完全一样**（都是 ``all://`` 指向一个代理 transport），
+    所以判定依据只能是我们自己的配置，不能靠"看到 mount 就拆"。
+    """
+    async with httpx.AsyncClient(proxy="http://127.0.0.1:7890") as client:
+        before = _proxy_mounts(client)
+        assert before, "前提：显式代理确实挂上了"
+
+        dropped = strip_inherited_proxies(client, explicit_proxy=True)
+
+        assert dropped == ()
+        assert _proxy_mounts(client) == before
+
+
+async def test_no_proxy_anywhere_is_a_no_op(monkeypatch, real_client_init) -> None:
+    """正对照：没有代理挂载时什么都不动（顺便证明我们不是"一律清空"）。"""
+    for var in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    async with httpx.AsyncClient() as client:
+        assert not _proxy_mounts(client), "前提：干净环境里本来就没有代理挂载"
+        assert strip_inherited_proxies(client, explicit_proxy=False) == ()

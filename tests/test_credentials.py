@@ -215,6 +215,57 @@ def test_bad_proxy_is_rejected(bad: str):
         load_proxy({"IMAGE_SEARCH_PROXY": bad})
 
 
+def test_proxy_error_does_not_echo_the_secret():
+    """错误信息不得回显代理解析原文 —— 它会经 server 的错误出口给调用方。
+
+    ``http://user:pass@`` 的原文里就写着密码。cookie 那条同类路径当时已经脱敏，
+    代理这条漏了（复核报告：错误代理 URL 回显 secret）。这里连用户名也不回显：
+    保留"哪一类问题"的信息就够定位，具体值没有理由外传。
+    """
+    secret = "SYNTHETIC_PROXY_SECRET"
+    with pytest.raises(CredentialError) as exc:
+        load_proxy({"IMAGE_SEARCH_PROXY": f"http://user:{secret}@"})
+
+    message = str(exc.value)
+    assert secret not in message
+    assert "user" not in message
+    assert "无主机名" in message      # 仍要能定位问题类别
+    assert "已隐去" in message        # 并说明原文为何不出现
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "http://[::1",       # IPv6 方括号不配对：urlparse 自己就抛 ValueError
+        "http://h:abc",      # 端口非数字
+        "http://h:0",        # 端口 0
+        "http://h:70000",    # 端口超出 1-65535
+    ],
+)
+def test_proxy_shape_errors_are_config_errors_not_internal_errors(bad: str):
+    """坏形状要当场归成配置错。
+
+    旧实现不查端口，非法端口一路漏到 httpx 才炸，被兜底成"内部错误（...）"——
+    那等于把纯配置问题说成我们的 bug，调用方拿到的是无从下手的类型名。
+    """
+    with pytest.raises(CredentialError) as exc:
+        load_proxy({"IMAGE_SEARCH_PROXY": bad})
+    assert exc.value.hint, "配置错要给可操作的提示"
+
+
+def test_valid_proxy_with_credentials_still_works():
+    """正例：脱敏只作用于错误信息，不能顺手把能用的代理弄坏。
+
+    ``load_proxy`` 必须原样交出 URL —— 带凭据的代理本来就是支持的用法，
+    下游要用它建连接。
+    """
+    raw = "http://user:pw@127.0.0.1:7890"
+    proxy = load_proxy({"IMAGE_SEARCH_PROXY": raw})
+    assert proxy is not None
+    assert proxy.url == raw
+    assert proxy.source == "IMAGE_SEARCH_PROXY"
+
+
 def test_generic_proxy_env_vars_are_not_used():
     """HTTP_PROXY / HTTPS_PROXY 不再被隐式采用。
 

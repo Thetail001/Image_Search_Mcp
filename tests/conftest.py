@@ -20,18 +20,23 @@ from typing import Any, Callable
 import httpx
 import pytest
 
-# 被测服务读取的全部配置项
-CONFIG_ENV_VARS = (
-    "IMAGE_SEARCH_API_KEY",
-    "IMAGE_SEARCH_COOKIES",
-    "IMAGE_SEARCH_PROXY",
+#: 被测服务读取的配置**前缀**。按前缀清，而不是维护一份变量名清单 —— 手写清单漏过：
+#: 带引擎后缀的 IMAGE_SEARCH_COOKIES_*、IMAGE_SEARCH_COOKIES_ENGINE、
+#: IMAGE_SEARCH_ALLOW_ANONYMOUS / IMAGE_SEARCH_ALLOWED_ORIGINS（复核报告第 12 问）。
+#: 漏一个就意味着测试行为取决于开发机上残留的变量。
+CONFIG_ENV_PREFIXES = ("IMAGE_SEARCH_", "MCP_")
+
+#: 没有前缀可循、且**不该**被采用的代理类变量：同样要清 ——
+#: 否则开发机上残留一个 HTTP_PROXY，会让"环境代理不生效"这条承诺看起来成立。
+BARE_PROXY_ENV_VARS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "http_proxy",
     "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
     "NO_PROXY",
     "no_proxy",
-    "MCP_AUTH_TOKEN",
 )
 
 #: 当前测试注册的 HTTP handler。None 表示"本测试不允许联网"。
@@ -58,7 +63,16 @@ def _dispatch(request: httpx.Request) -> httpx.Response:
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in CONFIG_ENV_VARS:
+    """把本服务的配置从环境里清干净。
+
+    按**前缀**扫而不是查一张手写清单：清单漏过带引擎后缀的变量
+    （IMAGE_SEARCH_COOKIES_TRACEMOE 之类），漏掉的变量会让测试行为取决于
+    开发机上的残留。
+    """
+    for name in list(os.environ):
+        if name.startswith(CONFIG_ENV_PREFIXES):
+            monkeypatch.delenv(name, raising=False)
+    for name in BARE_PROXY_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
 
 
@@ -85,6 +99,23 @@ def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> Any:
     _http_handler = None
 
 
+def _capture_real_getaddrinfo() -> Callable[..., Any]:
+    """在**模块加载时**抓下真实的 ``socket.getaddrinfo``。
+
+    不能等到夹具里现读：``_no_real_dns`` 是 autouse，跑到 ``allow_real_dns`` 时
+    ``socket.getaddrinfo`` 早已是拦截器，现读就是"把拦截器当真函数再装回去"——
+    于是"放行真实 DNS"从来没有真正放行过
+    （复核报告第 12 问实测 ``allow_real_dns_restored_original False``）。
+    """
+    import socket
+
+    return socket.getaddrinfo
+
+
+#: 真实 resolver 的原始引用。夹具必须用它，不能用现读的 socket.getaddrinfo。
+_REAL_GETADDRINFO = _capture_real_getaddrinfo()
+
+
 @pytest.fixture(autouse=True)
 def _no_real_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     """测试里也不做真实 DNS 解析。
@@ -105,12 +136,15 @@ def _no_real_dns(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def allow_real_dns(monkeypatch: pytest.MonkeyPatch):
-    """显式放行真实 DNS（仅给需要验证真实 resolver 的测试用）。"""
+    """显式放行真实 DNS（仅给需要验证真实 resolver 的测试用）。
+
+    装回去的是模块加载时抓下的**原始函数**，不是"当前值" —— 后者是被拦截器
+    覆盖过的那个。
+    """
     import socket
 
-    real = socket.getaddrinfo
-    monkeypatch.setattr(socket, "getaddrinfo", real)
-    return real
+    monkeypatch.setattr(socket, "getaddrinfo", _REAL_GETADDRINFO)
+    return _REAL_GETADDRINFO
 
 
 @pytest.fixture

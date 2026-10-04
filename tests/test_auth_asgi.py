@@ -239,18 +239,51 @@ async def test_token_with_surrounding_whitespace_is_accepted():
     assert status == 200
 
 
-async def test_duplicate_authorization_headers_fail_closed():
+@pytest.mark.parametrize(
+    "headers",
+    [
+        # 有效在前、无效在后：旧实现的 dict() 取后者 → 恰好 401
+        # （原来的测试只覆盖了这一种，于是"重复必须拒绝"这句是没被验证的）
+        [("authorization", f"Bearer {TOKEN}"), ("authorization", "Bearer " + "x" * 64)],
+        # 无效在前、有效在后：旧实现取到了有效值 → 实测 204 放行，这就是漏掉的一半
+        [("authorization", "Bearer " + "x" * 64), ("authorization", f"Bearer {TOKEN}")],
+        # 两个都有效：同样是歧义，照样拒绝（不能因为"值都对"就放行）
+        [("authorization", f"Bearer {TOKEN}"), ("authorization", f"Bearer {TOKEN}")],
+    ],
+)
+async def test_duplicate_authorization_headers_fail_closed(headers):
     """重复的认证头必须拒绝，不能"取第一个/最后一个"。
 
-    代理链上出现重复头时，两端的解读不一致就是经典的绕过手法。
+    代理链上出现重复头时，两端的解读不一致就是经典的绕过手法。旧实现直接
+    ``dict(scope["headers"])``（后者覆盖前者），于是**头顺序决定**是否放行。
+    重复头是歧义请求，回 400（与"畸形头回 400"的既有约定一致），
+    而不是伪装成 401 让人以为只是 token 不对。
     """
     downstream = _Downstream()
     app = AuthMiddleware(downstream, TOKEN)
-    status, _, _ = await _call_http(app, "POST", "/messages/", [
-        ("authorization", f"Bearer {TOKEN}"),
-        ("authorization", "Bearer " + "x" * 64),
-    ])
-    assert status == 401
+    status, _, _ = await _call_http(app, "POST", "/messages/", headers)
+    assert status == 400
+    assert downstream.calls == []
+
+
+async def test_duplicate_origin_headers_are_also_rejected():
+    """Origin 也参与安全判定（来源白名单），重复同样是歧义。
+
+    这条同时证明重复检查发生在"来源是否允许"之前：否则这里只会得到 403。
+    """
+    downstream = _Downstream()
+    app = AuthMiddleware(downstream, TOKEN)
+    status, _, _ = await _call_http(
+        app,
+        "POST",
+        "/messages/",
+        [
+            ("authorization", f"Bearer {TOKEN}"),
+            ("origin", "https://example.com"),
+            ("origin", "https://evil.example"),
+        ],
+    )
+    assert status == 400
     assert downstream.calls == []
 
 

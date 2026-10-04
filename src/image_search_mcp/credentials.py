@@ -311,6 +311,28 @@ class ProxyConfig:
     source: str
 
 
+def _described_proxy(raw: str) -> str:
+    """给错误信息用的代理描述：**只留结构与是否带凭据，绝不含 userinfo**。
+
+    ``http://user:pass@host`` 的原文里就写着密码，而 CredentialError 会被
+    server.py 回给工具调用方。cookie 那条同类路径当时已经脱敏，proxy 这条漏了
+    （复核报告：错误代理 URL 回显 secret）。连 URL 都解析不出来的输入，
+    更没有理由把原文倒回去。
+    """
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return "<无法解析，原文已隐去>"
+    where = parsed.hostname or "<无主机名>"
+    try:
+        if parsed.port:
+            where = f"{where}:{parsed.port}"
+    except ValueError:
+        where = f"{where}:<端口不合法>"
+    creds = "含凭据（已隐去）" if (parsed.username or parsed.password) else "无凭据"
+    return f"{parsed.scheme or '?'}://{where}（{creds}）"
+
+
 def load_proxy(env: Mapping[str, str] | None = None) -> ProxyConfig | None:
     """读出显式配置的代理。
 
@@ -318,6 +340,9 @@ def load_proxy(env: Mapping[str, str] | None = None) -> ProxyConfig | None:
     用户从没配过代理，却因为环境里有这个变量而让带凭据的请求走了某个代理；
     而且那条路径本身是坏的（传 dict 给只吃字符串的参数，直接抛
     ``AttributeError: 'dict' object has no attribute 'url'``）。现在只认显式配置。
+
+    所有报错都只回 ``_described_proxy`` 的结构化描述；原文（可能含密码）不出现
+    在任何异常消息里。
     """
     env = os.environ if env is None else env
 
@@ -325,14 +350,39 @@ def load_proxy(env: Mapping[str, str] | None = None) -> ProxyConfig | None:
     if not raw:
         return None
 
-    parsed = urlparse(raw)
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        raise CredentialError(
+            f"{PROXY_VAR} 不是合法的 URL：{_described_proxy(raw)}",
+            hint="例如 http://127.0.0.1:7890；IPv6 主机要写成 [::1] 这种带方括号的形式",
+        ) from None
+
     if parsed.scheme not in ("http", "https", "socks5", "socks5h"):
         raise CredentialError(
             f"{PROXY_VAR} 的 scheme {parsed.scheme!r} 不受支持",
             hint="允许 http / https / socks5 / socks5h，例如 http://127.0.0.1:7890",
         )
     if not parsed.hostname:
-        raise CredentialError(f"{PROXY_VAR} 缺少主机名：{raw!r}", hint="例如 http://127.0.0.1:7890")
+        raise CredentialError(
+            f"{PROXY_VAR} 缺少主机名：{_described_proxy(raw)}",
+            hint="例如 http://127.0.0.1:7890",
+        )
+
+    # 端口非法（非数字、0、超范围）以前会一路漏到 httpx 才炸，被兜底成"内部错误"——
+    # 那等于把一个纯配置问题说成我们的 bug。这里当场归成配置错。
+    try:
+        port = parsed.port
+    except ValueError:
+        raise CredentialError(
+            f"{PROXY_VAR} 的端口不合法：{_described_proxy(raw)}",
+            hint="端口要在 1-65535 之间，例如 http://127.0.0.1:7890",
+        ) from None
+    if port is not None and not (1 <= port <= 65535):
+        raise CredentialError(
+            f"{PROXY_VAR} 的端口超出范围：{_described_proxy(raw)}",
+            hint="端口要在 1-65535 之间，例如 http://127.0.0.1:7890",
+        )
 
     return ProxyConfig(url=raw, source=PROXY_VAR)
 

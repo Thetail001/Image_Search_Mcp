@@ -287,14 +287,94 @@ async def test_limit_actually_caps_the_output(http_log):
 
 
 async def test_no_results_is_not_an_error(http_log):
-    """「没有结果」是正常状态，不是错误 —— 它不该被标成失败。"""
+    """「没有结果」是正常状态，不是错误 —— 它不该被标成失败。
+
+    这条同时是下面那批用例的**正例对照**：修"上游报错被当成空结果"时很容易
+    过度纠正成"空 raw 一律失败"，那会把正常的没匹配到也报成错误。
+    """
     seen, state = http_log
     state["search_payload"] = NO_RESULTS
-    result = await _search_text(
+    outcome = await _search_logic(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=5
     )
-    assert result.startswith("Search Engine: TraceMoe")
-    assert "No results found." in result
+    assert outcome.is_error is False
+    assert outcome.text.startswith("Search Engine: TraceMoe")
+    assert "No results found." in outcome.text
+
+
+async def test_upstream_explicit_error_is_not_reported_as_no_results(http_log):
+    """上游明确报错 ≠ 没搜到（复核报告第 3 问）。
+
+    旧实现只看 ``if not raw``：上游把错误写进 ``error`` 字段、结果为空，
+    就会被报成成功的 "No results found."，协议层是 ``isError=false`` ——
+    调用方以为"这张图全网没有"，而不是"这次搜索失败了"。
+    """
+    seen, state = http_log
+    state["search_payload"] = {
+        "frameCount": 0,
+        "error": "synthetic upstream failure",
+        "result": [],
+    }
+    outcome = await _search_logic(
+        source="https://example.com/a.jpg", engine="TraceMoe", limit=5
+    )
+
+    assert outcome.is_error is True
+    assert "synthetic upstream failure" in outcome.text
+    assert "No results found." not in outcome.text
+
+
+async def test_http_error_status_is_an_error_even_with_an_empty_body():
+    """HTTP 层报错同样是明确信号：status_code >= 400 不能算成功空结果。"""
+
+    class Failed:
+        status_code = 503
+        raw = []
+
+    outcome = server._format_response("SauceNAO", Failed(), 5)
+    assert outcome.is_error is True
+    assert "503" in outcome.text
+
+
+@pytest.mark.parametrize("engine", ["SauceNAO", "TraceMoe"])
+def test_engine_specific_error_field_is_honoured(engine: str):
+    """错误字段按引擎而异：TraceMoe.error、SauceNAO.status（0 表示正常）。"""
+
+    class FailedResponse:
+        raw = []
+        error = "quota exceeded"
+        status = 429
+
+    outcome = server._format_response(engine, FailedResponse(), 5)
+    assert outcome.is_error is True
+    assert "No results found." not in outcome.text
+
+
+@pytest.mark.parametrize("bad_response", [None, object()])
+def test_response_without_raw_is_a_contract_error(bad_response):
+    """连 raw 都没有的响应是响应契约错误：既不是"没结果"，也不能算成功。"""
+    outcome = server._format_response("TraceMoe", bad_response, 5)
+    assert outcome.is_error is True
+    assert "raw" in outcome.text
+
+
+def test_raw_none_is_a_contract_error():
+    class RawIsNone:
+        raw = None
+
+    outcome = server._format_response("TraceMoe", RawIsNone(), 5)
+    assert outcome.is_error is True
+    assert "None" in outcome.text
+
+
+def test_upstream_error_text_redacts_base64_data_uri():
+    """上游错误里可能把我们发过去的 data URI 整段倒回来：不进结果、不超长。"""
+    payload = "data:image/png;base64," + "A" * 5000
+    text = server._redact_upstream(f"invalid image: {payload}")
+
+    assert "data:<redacted>" in text
+    assert "AAAA" not in text
+    assert len(text) <= 201
 
 
 # ==========================================================================

@@ -30,6 +30,23 @@ ANILIST_RESPONSE = {"data": {"Media": {
 NO_RESULTS = {"frameCount": 0, "error": "", "result": []}
 
 
+#: 新契约下 ``_search_image_logic`` 返回 ``SearchOutcome`` 而不是字符串。
+#: 存个别名：下面各用例统一取文本，而辅助函数本身**必须**用别名调用 ——
+#: 否则下面那次批量替换会把辅助函数内部的调用也换掉，它就自己调自己了。
+_search_logic = server._search_image_logic
+
+
+async def _search_text(*args, **kwargs) -> str:
+    """取"给人看的文本"。
+
+    ``_search_image_logic`` 现在返回 ``SearchOutcome``（文本 + 结构 + is_error），
+    因为 MCP 层要区分"没结果"和"搜索失败"。这个文件里的用例关心的是文本与副作用，
+    所以统一从这里取文本；协议层那几条断言另有一组用例（``test_mcp_contract.py``）。
+    """
+    outcome = await _search_logic(*args, **kwargs)
+    return outcome.text
+
+
 @pytest.fixture
 def http_log(mock_http):
     """记录所有出站请求，并给出可解析的默认响应。"""
@@ -64,7 +81,7 @@ async def test_non_empty_cookies_do_not_crash_and_are_sent_to_the_engine_domain(
     monkeypatch.setenv("IMAGE_SEARCH_COOKIES_TRACEMOE", "sid=ENGINE_SECRET")
     seen, _ = http_log
 
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=1
     )
 
@@ -79,7 +96,7 @@ async def test_engine_cookies_do_not_go_to_the_anilist_endpoint(http_log, monkey
     但**不能**发给完全无关的域。"""
     monkeypatch.setenv("IMAGE_SEARCH_COOKIES_TRACEMOE", "sid=ENGINE_SECRET")
     seen, _ = http_log
-    await server._search_image_logic(
+    await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=1
     )
     # 先确认真的发生了出站、且真的带了凭据：不加这两句的话，``seen`` 为空时
@@ -98,7 +115,7 @@ async def test_global_cookie_without_owner_refuses_with_actionable_message(
     monkeypatch.setenv("IMAGE_SEARCH_COOKIES", "sid=X")
     seen, _ = http_log
 
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=1
     )
 
@@ -112,7 +129,7 @@ async def test_non_empty_proxy_does_not_crash(http_log, monkeypatch):
     monkeypatch.setenv("IMAGE_SEARCH_PROXY", "http://127.0.0.1:7890")
     seen, _ = http_log
 
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=1
     )
 
@@ -203,7 +220,7 @@ async def test_bad_base64_source_is_rejected(bad: str):
 
 
 async def test_bad_base64_is_reported_through_the_public_entry(http_log):
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="!!!!not base64!!!!", engine="TraceMoe", limit=1
     )
     assert result.startswith("Error:")
@@ -213,7 +230,7 @@ async def test_bad_base64_is_reported_through_the_public_entry(http_log):
 
 async def test_oversized_base64_is_rejected_before_decoding(http_log):
     huge = "A" * (server.MAX_IMAGE_BYTES // 3 * 4 + 1000)
-    result = await server._search_image_logic(source=huge, engine="TraceMoe", limit=1)
+    result = await _search_text(source=huge, engine="TraceMoe", limit=1)
     assert "上限" in result
     assert http_log[0] == []
 
@@ -226,7 +243,7 @@ async def test_oversized_base64_is_rejected_before_decoding(http_log):
 async def test_out_of_range_limit_is_rejected_without_any_request(http_log, limit: int):
     """旧代码把 limit 直接用在切片上：``-1`` 产出
     "showing top -1" 却给 2 条；``0`` 仍然真的发了一次搜索请求。"""
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=limit
     )
     assert result.startswith("Error:")
@@ -236,7 +253,7 @@ async def test_out_of_range_limit_is_rejected_without_any_request(http_log, limi
 
 @pytest.mark.parametrize("limit", ["5", 5.0, True, None])
 async def test_non_integer_limit_is_rejected(http_log, limit):
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=limit
     )
     assert result.startswith("Error:")
@@ -245,7 +262,7 @@ async def test_non_integer_limit_is_rejected(http_log, limit):
 
 @pytest.mark.parametrize("limit", [server.LIMIT_MIN, server.LIMIT_MAX, 5])
 async def test_valid_limit_is_accepted(http_log, limit: int):
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=limit
     )
     assert result.startswith("Search Engine: TraceMoe")
@@ -262,7 +279,7 @@ async def test_limit_actually_caps_the_output(http_log):
             for i in (1, 2, 3)
         ],
     }
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=2
     )
     assert "Found 3 results (showing top 2, truncated)" in result
@@ -273,7 +290,7 @@ async def test_no_results_is_not_an_error(http_log):
     """「没有结果」是正常状态，不是错误 —— 它不该被标成失败。"""
     seen, state = http_log
     state["search_payload"] = NO_RESULTS
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=5
     )
     assert result.startswith("Search Engine: TraceMoe")
@@ -285,7 +302,7 @@ async def test_no_results_is_not_an_error(http_log):
 # ==========================================================================
 
 async def test_unknown_engine_is_rejected(http_log):
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="DefinitelyNotAnEngine", limit=1
     )
     assert "不支持的引擎" in result
@@ -300,7 +317,7 @@ async def test_error_output_does_not_leak_a_traceback_or_server_paths(http_log):
     seen, state = http_log
     state["search_payload"] = {"unexpected": "shape"}
 
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=1
     )
 
@@ -317,7 +334,7 @@ async def test_unexpected_exception_is_reported_without_details(caplog, monkeypa
 
     monkeypatch.setattr(server, "_prepare_search_input", _boom)
 
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=1
     )
 

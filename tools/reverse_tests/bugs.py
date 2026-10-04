@@ -58,12 +58,20 @@ INJECTIONS: tuple[BugInjection, ...] = (
         name="error-leaks-exception-text",
         path="src/image_search_mcp/server.py",
         old=(
-            "        return (\n"
-            '            f"Error: 搜索过程中发生内部错误（{type(exc).__name__}）。"\n'
-            '            "详细信息见服务端日志。"\n'
+            "        return SearchOutcome(\n"
+            "            text=(\n"
+            '                f"Error: 搜索过程中发生内部错误（{type(exc).__name__}）。"\n'
+            '                "详细信息见服务端日志。"\n'
+            "            ),\n"
+            "            is_error=True,\n"
             "        )"
         ),
-        new='        return f"Error: 内部错误（{type(exc).__name__}）: {exc}"',
+        new=(
+            "        return SearchOutcome(\n"
+            '            text=f"Error: 内部错误（{type(exc).__name__}）: {exc}",\n'
+            "            is_error=True,\n"
+            "        )"
+        ),
         test=(
             "tests/test_search_flow.py"
             "::test_unexpected_exception_is_reported_without_details"
@@ -418,6 +426,112 @@ INJECTIONS: tuple[BugInjection, ...] = (
             "::test_every_upstream_host_is_declared_or_explicitly_excused"
         ),
         why="域表少一项时凭据发不出去（功能坏但没人知道）；单向核验发现不了这个",
+    ),
+    # ------------------------------------------- MCP 协议层（isError / 结构 / 注解）
+    BugInjection(
+        name="tool-annotations-dropped",
+        path="src/image_search_mcp/server.py",
+        old=(
+            "@mcp.tool(\n"
+            '    title="以图搜图",\n'
+            "    annotations=SEARCH_ANNOTATIONS,\n"
+            "    output_schema=SEARCH_OUTPUT_SCHEMA,\n"
+            ")"
+        ),
+        new=(
+            "@mcp.tool(\n"
+            '    title="以图搜图",\n'
+            "    output_schema=SEARCH_OUTPUT_SCHEMA,\n"
+            ")"
+        ),
+        test=(
+            "tests/test_mcp_contract.py"
+            "::test_search_tool_declares_read_only_and_open_world"
+        ),
+        why="不声明只读/外部访问，客户端只能把这个只读工具当危险操作处理",
+    ),
+    BugInjection(
+        name="output-schema-dropped",
+        path="src/image_search_mcp/server.py",
+        old=(
+            "@mcp.tool(\n"
+            '    title="以图搜图",\n'
+            "    annotations=SEARCH_ANNOTATIONS,\n"
+            "    output_schema=SEARCH_OUTPUT_SCHEMA,\n"
+            ")"
+        ),
+        new=(
+            "@mcp.tool(\n"
+            '    title="以图搜图",\n'
+            "    annotations=SEARCH_ANNOTATIONS,\n"
+            ")"
+        ),
+        test=(
+            "tests/test_mcp_contract.py"
+            "::test_search_tool_declares_the_output_schema_we_promised"
+        ),
+        why="没有 outputSchema，客户端就只能靠解析文本，等于结构化输出承诺是空的",
+    ),
+    BugInjection(
+        name="tool-error-returned-as-normal-result",
+        path="src/image_search_mcp/server.py",
+        old=(
+            "    outcome = await _search_image_logic(source, engine, extra_params_json, limit)\n"
+            "    if outcome.is_error:\n"
+            "        # 工具执行错误 → 按 MCP 规范用 isError=true 交回给调用方，让它/模型能自我修正。\n"
+            "        # 用 ToolError 而不是让裸异常冒出去：后者的文本会被加上\n"
+            '        # 「Error calling tool \'search_image\': 」前缀（实测），对模型只是噪音。\n'
+            "        raise ToolError(outcome.text)\n"
+            "    return ToolResult(content=outcome.text, structured_content=outcome.structured)"
+        ),
+        new=(
+            "    outcome = await _search_image_logic(source, engine, extra_params_json, limit)\n"
+            "    # 注入：把失败当正常结果返回\n"
+            "    return ToolResult(content=outcome.text, structured_content=outcome.structured)"
+        ),
+        test="tests/test_mcp_contract.py::test_input_rejections_come_back_as_is_error",
+        why="失败退化成「看起来正常的结果」，客户端与模型都无法区分",
+    ),
+    BugInjection(
+        name="bare-exception-instead-of-tool-error",
+        path="src/image_search_mcp/server.py",
+        old="        raise ToolError(outcome.text)",
+        new="        raise ValueError(outcome.text)  # 注入：用裸异常",
+        test=(
+            "tests/test_mcp_contract.py"
+            "::test_error_text_does_not_gain_a_tool_name_prefix"
+        ),
+        why="裸异常的文本被 fastmcp 加上「Error calling tool 'x': 」前缀，报错不再是我们写的那句",
+    ),
+    BugInjection(
+        name="structured-content-dropped",
+        path="src/image_search_mcp/server.py",
+        old="    return ToolResult(content=outcome.text, structured_content=outcome.structured)",
+        new="    return ToolResult(content=outcome.text)  # 注入：不给结构化内容",
+        test=(
+            "tests/test_mcp_contract.py"
+            "::test_successful_search_returns_structured_content_and_keeps_the_text"
+        ),
+        why="声明了 outputSchema 却不给 structuredContent，客户端只能回去解析文本",
+    ),
+    BugInjection(
+        name="no-results-marked-as-error",
+        path="src/image_search_mcp/server.py",
+        old=(
+            "        return SearchOutcome(\n"
+            '            text="\\n".join(lines),\n'
+            "            structured=_structured_results(engine, [], limit),\n"
+            "        )"
+        ),
+        new=(
+            "        return SearchOutcome(\n"
+            '            text="\\n".join(lines),\n'
+            "            structured=_structured_results(engine, [], limit),\n"
+            "            is_error=True,  # 注入：把「没结果」也标成错误\n"
+            "        )"
+        ),
+        test="tests/test_mcp_contract.py::test_no_results_is_not_an_error",
+        why="把「没搜到」报成失败，会让模型去修一个并不存在的问题（过度报错也是错）",
     ),
 )
 

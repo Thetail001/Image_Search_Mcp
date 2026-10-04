@@ -23,6 +23,32 @@ find_uv() {
 
 UV_BIN=$(find_uv)
 
+# ---------------------------------------------------------------------------
+# 服务单元名：**单一事实来源**
+#
+# 早先这里硬编码成 `image-search`，而线上跑的是 `image-search-mcp` —— 实测确认：
+# 照旧脚本跑既不会重启到真正在跑的服务，还会额外造一个同名的假单元。
+# ---------------------------------------------------------------------------
+UNIT_NAME="${IMAGE_SEARCH_UNIT:-image-search-mcp}"
+UNIT_PATH="/etc/systemd/system/${UNIT_NAME}.service"
+
+# 已有单元默认**不覆盖**。线上那份把凭据直接写在单元里
+# （Environment=MCP_AUTH_TOKEN=...），而这个脚本写的是 EnvironmentFile=.env ——
+# 覆盖一下凭据就没了，服务起不来。要替换必须显式说，而且会先备份。
+REPLACE_UNIT=0
+for arg in "$@"; do
+    case "$arg" in
+        --replace-unit) REPLACE_UNIT=1 ;;
+        -h|--help)
+            sed -n '2,6p' "$0"
+            echo "用法: $0 [--replace-unit]"
+            echo "  IMAGE_SEARCH_UNIT=<名字>  覆盖单元名（默认 image-search-mcp）"
+            exit 0
+            ;;
+        *) echo "未知参数：$arg（试 --help）" >&2; exit 2 ;;
+    esac
+done
+
 # 检查是否已安装
 if [ -f ".env" ] && [ -n "$UV_BIN" ]; then
     echo "检测到已有配置和 uv 环境。"
@@ -32,15 +58,25 @@ if [ -f ".env" ] && [ -n "$UV_BIN" ]; then
     if [ "$IS_UPDATE" = "y" ]; then
         echo -e "\n[1/3] 正在升级 image-search-mcp..."
         "$UV_BIN" tool upgrade image-search-mcp || "$UV_BIN" tool install --python 3.12 image-search-mcp
-        
-        echo "[2/3] 重载并重启服务..."
-        sudo systemctl restart image-search
-        
+
+        # 先确认单元真的存在再重启：**这个脚本只升级代码并重启已存在的单元**，
+        # 不负责替你猜单元名。旧版本在这里会去重启一个不存在的服务名。
+        if ! systemctl cat "${UNIT_NAME}" >/dev/null 2>&1; then
+            echo "错误: 找不到服务单元 ${UNIT_NAME}" >&2
+            echo "  线上实际用的是 image-search-mcp.service；" >&2
+            echo "  若目标机器上叫别的名字，用 IMAGE_SEARCH_UNIT=<名字> 覆盖。" >&2
+            exit 1
+        fi
+
+        echo "[2/3] 重载并重启服务（${UNIT_NAME}）..."
+        sudo systemctl daemon-reload
+        sudo systemctl restart "${UNIT_NAME}"
+
         echo "[3/3] 检查状态..."
         sleep 2
-        echo "服务状态: $(sudo systemctl is-active image-search)"
+        echo "服务状态: $(sudo systemctl is-active "${UNIT_NAME}")"
         echo "✅ 更新完成！"
-        echo "查看日志: journalctl -u image-search -f"
+        echo "查看日志: journalctl -u ${UNIT_NAME} -f"
         exit 0
     fi
 fi
@@ -116,7 +152,23 @@ echo -e "\n[5/6] 创建 Systemd 服务..."
 CURRENT_USER=$(whoami)
 CURRENT_DIR=$(pwd)
 
-sudo bash -c "cat << EOF > /etc/systemd/system/image-search.service
+WRITE_UNIT=1
+if sudo test -f "${UNIT_PATH}"; then
+    if [ "$REPLACE_UNIT" != "1" ]; then
+        WRITE_UNIT=0
+        echo "已存在 ${UNIT_PATH}，**不覆盖**。"
+        echo "  线上那份把凭据写在单元里（Environment=MCP_AUTH_TOKEN=...），"
+        echo "  而本脚本写的是 EnvironmentFile=.env —— 覆盖会把凭据弄丢，服务就起不来了。"
+        echo "  确实要替换就加 --replace-unit（会先按时间戳备份）。"
+    else
+        UNIT_BACKUP="${UNIT_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+        sudo cp -a "${UNIT_PATH}" "${UNIT_BACKUP}"
+        echo "已备份原单元 → ${UNIT_BACKUP}"
+    fi
+fi
+
+if [ "$WRITE_UNIT" = "1" ]; then
+    sudo bash -c "cat << EOF > ${UNIT_PATH}
 [Unit]
 Description=Image Search MCP Server
 After=network.target
@@ -135,18 +187,19 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF"
+fi
 
 # 5. 启动服务
 echo -e "\n[6/6] 启动并激活服务..."
 sudo systemctl daemon-reload
-sudo systemctl enable image-search
-sudo systemctl restart image-search
+sudo systemctl enable "${UNIT_NAME}"
+sudo systemctl restart "${UNIT_NAME}"
 
 # 6. 最终检查
 echo "------------------------------------------------"
 echo "✅ 部署完成！"
-echo "服务状态: $(sudo systemctl is-active image-search)"
+echo "服务状态: $(sudo systemctl is-active "${UNIT_NAME}")"
 echo "访问地址: http://$(curl -s ifconfig.me):${PORT}/sse"
 echo "Python版本: $($UV_BIN run --python 3.12 python --version)"
 echo "------------------------------------------------"
-echo "查看实时日志命令: journalctl -u image-search -f"
+echo "查看实时日志命令: journalctl -u ${UNIT_NAME} -f"

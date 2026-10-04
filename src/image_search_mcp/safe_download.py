@@ -171,23 +171,42 @@ class Target:
     path_and_query: str
 
     @property
-    def host_header(self) -> str:
+    def _authority(self) -> str:
+        """authority 段。**IPv6 字面量必须带方括号** —— 否则 ``host:port`` 会被
+        重新解析成别的东西（旧实现把 ``2606:4700::1111:8443`` 当主机名发了出去，
+        于是在重定向的下一跳重新 parse 时直接坏掉）。
+        """
+        host = f"[{self.host}]" if ":" in self.host else self.host
         default = 443 if self.scheme == "https" else 80
-        return self.host if self.port == default else f"{self.host}:{self.port}"
+        return host if self.port == default else f"{host}:{self.port}"
+
+    @property
+    def host_header(self) -> str:
+        return self._authority
 
     @property
     def display(self) -> str:
-        default = 443 if self.scheme == "https" else 80
-        netloc = self.host if self.port == default else f"{self.host}:{self.port}"
-        return f"{self.scheme}://{netloc}{self.path_and_query}"
+        return f"{self.scheme}://{self._authority}{self.path_and_query}"
 
 
 def parse_target(url: str, policy: DownloadPolicy) -> Target:
+    """解析并规范化 URL。
+
+    ``urlsplit`` 与 ``.port`` **自己就会抛 ValueError**（非法端口、方括号不配对等）。
+    这里统一包装成 ``invalid_url``：否则调用方看到的是一条裸 ``ValueError``，
+    分不清"用户给了坏 URL"与"服务端出错了"（复核报告 B1 逐个实测了这一串）。
+    """
     if not isinstance(url, str) or not url.strip():
         raise DownloadError("invalid_url", "URL 为空", url=str(url))
 
-    parts = urlsplit(url.strip())
-    scheme = (parts.scheme or "").lower()
+    try:
+        parts = urlsplit(url.strip())
+        scheme = (parts.scheme or "").lower()
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError as exc:
+        raise DownloadError("invalid_url", f"URL 无法解析：{exc}", url=url) from exc
+
     if scheme not in policy.allowed_schemes:
         raise DownloadError(
             "invalid_url",
@@ -195,24 +214,39 @@ def parse_target(url: str, policy: DownloadPolicy) -> Target:
             url=url,
         )
 
-    if not parts.hostname:
+    if not hostname:
         raise DownloadError("invalid_url", f"URL 缺少主机名：{url!r}", url=url)
 
     if (parts.username or parts.password) and not policy.allow_userinfo:
         raise DownloadError("invalid_url", "URL 不允许内嵌用户名/密码", url=url)
 
-    port = parts.port
     if port is None:
         port = 443 if scheme == "https" else 80
     if not (1 <= port <= 65535):
         raise DownloadError("invalid_url", f"端口 {port} 非法", url=url)
 
+    # 非 ASCII 主机名先转 IDNA。不转的话它会被原样放进 Host 头，
+    # 直到构造请求时才抛出 UnicodeEncodeError（复核报告 B1 实测「例子.测试」）。
+    bare_host = hostname.rstrip(".")
+    try:
+        ipaddress.ip_address(bare_host.split("%")[0])  # 字面量地址：原样保留
+        host = bare_host
+    except ValueError:
+        try:
+            host = bare_host.encode("idna").decode("ascii")
+        except (UnicodeError, ValueError) as exc:
+            raise DownloadError(
+                "invalid_url", f"主机名无法转为 IDNA：{exc}", url=url
+            ) from exc
+
+    if not host:
+        raise DownloadError("invalid_url", "URL 主机名为空", url=url)
+
     path = parts.path or "/"
     if parts.query:
         path = f"{path}?{parts.query}"
 
-    return Target(scheme=scheme, host=parts.hostname.rstrip("."), port=port,
-                  path_and_query=path)
+    return Target(scheme=scheme, host=host, port=port, path_and_query=path)
 
 
 # --------------------------------------------------------------------------
@@ -346,6 +380,10 @@ class SafeDownloader:
                 raise DownloadError("timeout", "下载总期限已到", url=current)
 
             target = parse_target(current, self.policy)
+            # 把**当前**这一跳记进 visited。不记的话，一个指回起点的重定向
+            # 要等到再发一次请求之后才被发现（复核报告 B1）。
+            if target.display not in visited:
+                visited.append(target.display)
             addresses = await resolve_and_validate(target, self.policy, self._resolver)
 
             response_status, location, body = await self._request_once(
@@ -353,12 +391,8 @@ class SafeDownloader:
             )
 
             if response_status in REDIRECT_STATUSES:
-                if hop >= self.policy.max_redirects:
-                    raise DownloadError(
-                        "too_many_redirects",
-                        f"重定向超过 {self.policy.max_redirects} 跳",
-                        url=current,
-                    )
+                # 缺 Location、成环要先判：放在跳数之后的话，在最后一跳
+                # 这些更具体的原因会被 too_many_redirects 盖住（复核报告 B1）
                 if not location:
                     raise DownloadError("redirect_without_location", "重定向缺少 Location", url=current)
 
@@ -376,14 +410,14 @@ class SafeDownloader:
                     )
                 if next_target.display in visited:
                     raise DownloadError("redirect_loop", "重定向成环", url=next_target.display)
-                visited.append(target.display)
+                if hop >= self.policy.max_redirects:
+                    raise DownloadError(
+                        "too_many_redirects",
+                        f"重定向超过 {self.policy.max_redirects} 跳",
+                        url=current,
+                    )
                 current = next_target.display
                 continue
-
-            if response_status >= 400:
-                raise DownloadError(
-                    "http_error", f"目标返回 HTTP {response_status}", url=target.display
-                )
 
             if not body:
                 raise DownloadError("empty_body", "目标返回空内容", url=target.display)
@@ -403,19 +437,28 @@ class SafeDownloader:
         会依次尝试解析出的各个地址；全部失败才报错。
         """
         last_error: Exception | None = None
+        timed_out = False
 
         for address in addresses:
             try:
                 return await self._request_pinned(target, address, deadline)
             except DownloadError:
                 raise
+            except httpx.TimeoutException as exc:
+                # 单次 I/O 超时与"连不上"对排查的含义完全不同：
+                # 过去 ReadTimeout 也被归成 connection_failed（复核报告 B1）
+                last_error = exc
+                timed_out = True
+                continue
             except (httpx.HTTPError, OSError) as exc:
                 last_error = exc
                 continue
 
+        # 只报异常**类型名**，不把 str(exc) 拼进来：它可能带目标 URL 或本地细节
         raise DownloadError(
-            "connection_failed",
-            f"无法连接 {target.host}（尝试 {addresses}）：{last_error}",
+            "timeout" if timed_out else "connection_failed",
+            f"无法连接 {target.host}（尝试 {addresses}）："
+            f"{type(last_error).__name__ if last_error else '未知异常'}",
             url=target.display,
         )
 
@@ -460,6 +503,14 @@ class SafeDownloader:
                 status = response.status_code
                 if status in REDIRECT_STATUSES:
                     return status, response.headers.get("location"), b""
+
+                if status >= 400:
+                    # 在**读 body 之前**判定。先读完再报的话，一个大 body 的错误页
+                    # 会被归成 too_large（复核报告 B1 实测：503 带超限 Content-Length
+                    # 报的是 too_large 而不是 http_error），而且白下载一遍。
+                    raise DownloadError(
+                        "http_error", f"目标返回 HTTP {status}", url=target.display
+                    )
 
                 # Content-Length 只用来提前拒绝，**不能代替**实际计数：
                 # 分块响应、以及谎报长度的响应都必须靠流式累计来兜住

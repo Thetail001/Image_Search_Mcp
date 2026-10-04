@@ -82,6 +82,10 @@ async def test_engine_cookies_do_not_go_to_the_anilist_endpoint(http_log, monkey
     await server._search_image_logic(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=1
     )
+    # 先确认真的发生了出站、且真的带了凭据：不加这两句的话，``seen`` 为空时
+    # 循环体一次都不执行，这条测试会在"什么都没发生"的情况下通过（复核报告 B6）。
+    assert seen, "应当已经有出站请求"
+    assert any(r.headers.get("cookie") for r in seen), "至少一个请求要带上凭据，否则是空转"
     for request in seen:
         host = request.url.host
         assert host.endswith("trace.moe"), f"凭据不该发给 {host}"

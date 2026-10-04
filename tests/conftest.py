@@ -114,6 +114,26 @@ def allow_real_dns(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
+def real_client_init(monkeypatch: pytest.MonkeyPatch):
+    """临时恢复真实的 ``httpx.AsyncClient.__init__``（不做 transport 注入）。
+
+    为什么必须有这个开口：``_no_real_network`` 会给每个 client 注入
+    ``MockTransport``，而 httpx 里算的是
+
+        allow_env_proxies = trust_env and transport is None
+
+    —— 一旦传了 transport，它**根本不去读环境代理**。于是"环境代理会不会被采用"
+    这类行为在默认夹具下永远测不到：把实现改回 ``trust_env=True`` 测试照样全绿
+    （复核报告 B6 那条假测试，根因就在这里，不在测试写法上）。
+
+    用它时注意：这个 client 走真实 transport，出站会真的发出去。
+    只构造、不发送是安全的（仓库里用它来观察 ``_mounts``）。
+    """
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", _real_async_init)
+    yield
+
+
+@pytest.fixture
 def mock_http() -> Callable[[Callable[[httpx.Request], httpx.Response]], None]:
     """注册本测试的出站 HTTP handler。
 

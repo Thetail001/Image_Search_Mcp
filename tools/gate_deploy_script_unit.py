@@ -62,7 +62,11 @@ case "$1" in
       fi
       cat "$state/is-active.txt" 2>/dev/null || true
       exit "$(cat "$state/is-active.rc" 2>/dev/null || echo 0)" ;;
-  *) exit 0 ;;
+  status)
+      echo "（桩）status ${2:-}"
+      exit "$(cat "$state/is-active.rc" 2>/dev/null || echo 0)" ;;
+  daemon-reload|enable|restart|disable|start|stop) exit 0 ;;
+  *) echo "桩不认这个 systemctl 动作：$*" >&2; exit 3 ;;
 esac
 """,
     "uv": r"""#!/bin/bash

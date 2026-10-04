@@ -100,19 +100,25 @@ INJECTIONS: tuple[BugInjection, ...] = (
         name="download-total-deadline-removed",
         path="src/image_search_mcp/safe_download.py",
         old=(
-            "            if time.monotonic() >= deadline:\n"
-            "                raise DownloadError(\n"
-            '                    "timeout",\n'
-            '                    f"下载超过总期限 {self.policy.total_timeout}s（已读取 {total} 字节）",\n'
-            "                    url=target.display,\n"
-            "                )"
+            "        budget = self.policy.total_timeout\n"
+            "        try:\n"
+            "            return await asyncio.wait_for(self._fetch_hops(url, budget), budget)\n"
+            "        except asyncio.TimeoutError as exc:\n"
+            '            raise DownloadError("timeout", "下载总期限已到", url=url) from exc'
         ),
-        new="            pass  # 注入：总期限检查被去掉",
+        new=(
+            "        budget = self.policy.total_timeout\n"
+            "        # 注入：去掉绝对期限\n"
+            "        return await self._fetch_hops(url, budget)"
+        ),
         test=(
             "tests/test_safe_download.py"
             "::test_slow_trickle_is_stopped_by_total_deadline"
         ),
-        why="慢速下载拖死连接：总期限只在跳与跳之间检查、读取循环里不检查",
+        why="慢速下载拖死连接：没有绝对期限时，一个总量合法、永远发不完的响应"
+            "会让连接一直挂着。注意这条与 download-deadline-not-wrapping-bare-awaits "
+            "注入的是**同一处**代码 —— 一个机制由两条独立测试盯着（滴流、卡住的 resolver），"
+            "两条都必须会红",
     ),
     # ---------------------------------------------------------------- 批次 1-5
     BugInjection(
@@ -160,6 +166,96 @@ INJECTIONS: tuple[BugInjection, ...] = (
         ),
         why="文档腐烂：参数名写错（驼峰 vs 下划线）时没有任何东西会红，"
             "读者照着抄只会得到『设置了但没反应』",
+    ),
+    # ------------------------------------------- 复核报告 A：应当立刻修的四条
+    BugInjection(
+        name="download-deadline-not-wrapping-bare-awaits",
+        path="src/image_search_mcp/safe_download.py",
+        old=(
+            "        budget = self.policy.total_timeout\n"
+            "        try:\n"
+            "            return await asyncio.wait_for(self._fetch_hops(url, budget), budget)\n"
+            "        except asyncio.TimeoutError as exc:\n"
+            '            raise DownloadError("timeout", "下载总期限已到", url=url) from exc'
+        ),
+        new=(
+            "        budget = self.policy.total_timeout\n"
+            "        # 注入：去掉外层绝对期限，期限只在检查点比较\n"
+            "        return await self._fetch_hops(url, budget)"
+        ),
+        test=(
+            "tests/test_safe_download.py"
+            "::test_resolver_that_never_returns_hits_the_deadline"
+        ),
+        why="期限盖不住裸 await：只在「每跳开始」和「收到 chunk」处比较，"
+            "resolver 卡住时两个检查点都到不了，协程永远挂着、自己不报 timeout",
+    ),
+    BugInjection(
+        name="content-encoding-rejection-removed",
+        path="src/image_search_mcp/safe_download.py",
+        old=(
+            '                encoding = (response.headers.get("content-encoding") or "").strip().lower()\n'
+            '                if encoding and encoding != "identity":'
+        ),
+        new=(
+            '                encoding = ""  # 注入：不再在读之前拒绝压缩响应\n'
+            "                if False:"
+        ),
+        test=(
+            "tests/test_safe_download.py"
+            "::test_compressed_response_is_refused_before_it_is_decompressed"
+        ),
+        why="解压发生在计数之前：httpx 先 decode 再 yield，gzip 解压没有输出上限 ——"
+            "实测 32 MiB 压成 32 KB、预算 1 MiB，最终报 too_large，"
+            "但此前分配峰值已到 77.41 MiB",
+    ),
+    BugInjection(
+        name="extra-denied-networks-removed",
+        path="src/image_search_mcp/safe_download.py",
+        old=(
+            "    # 跨版本稳定的显式拒绝，放在 flag 之前判\n"
+            "    if any(addr in net for net in _EXTRA_DENIED_NETWORKS):\n"
+            "        return False"
+        ),
+        new="    pass  # 注入：显式网段表被去掉，只靠 stdlib 的 flag",
+        test=(
+            "tests/test_safe_download.py"
+            "::test_special_purpose_blocks_flagged_global_are_still_rejected"
+        ),
+        why="fec0::/10 在本机 Python 上 is_global=True 且 private/reserved 全 False，"
+            "所有 flag 都不拦 —— 只能靠显式网段表",
+    ),
+    BugInjection(
+        name="cookie-value-equals-rejected",
+        path="src/image_search_mcp/credentials.py",
+        old='        name, sep, value = segment.partition("=")',
+        new=(
+            '        if segment.count("=") > 1:\n'
+            "            raise CredentialError(\n"
+            '                f"{engine} 的 cookies 第 {index} 个片段的值里不能有 =" ,\n'
+            "                hint=\"格式为 'name=value'\",\n"
+            "            )\n"
+            '        name, sep, value = segment.partition("=")'
+        ),
+        test="tests/test_credentials.py::test_cookie_values_may_contain_equals",
+        why="过严：旧正则禁止值里出现 '='，把 base64 编码的凭据（sid=YWJjZA==）全部误拒",
+    ),
+    BugInjection(
+        name="cookie-error-echoes-value",
+        path="src/image_search_mcp/credentials.py",
+        old='                f"{engine} 的 cookies 第 {index} 个片段的名称不合法",',
+        new='                f"{engine} 的 cookies 片段 {segment!r} 的名称不合法",',
+        test="tests/test_credentials.py::test_cookie_error_does_not_echo_credential_value",
+        why="错误信息回显凭据值，而它会经 server 的错误出口返回给调用方 ——"
+            "等于把 cookie 值写进对方的日志",
+    ),
+    BugInjection(
+        name="cookie-control-chars-accepted",
+        path="src/image_search_mcp/credentials.py",
+        old="        if _COOKIE_VALUE_FORBIDDEN.search(value):",
+        new="        if False:  # 注入：值里的控制字符不再检查",
+        test="tests/test_credentials.py::test_malformed_cookie_segments_are_rejected",
+        why="过宽：旧校验放行名称里的空格与值里的 NUL，会污染实际发出去的请求头",
     ),
 )
 

@@ -117,6 +117,46 @@ def test_non_public_addresses_are_rejected(addr: str):
 
 
 @pytest.mark.parametrize("addr", [
+    # 这一组是 stdlib 的 flag 表**盖不住**的特殊用途网段：本机 Python 对它们的
+    # is_global 为 True、private/reserved 全为 False，所有 flag 都不拦。
+    # 这几条只能靠显式网段表拒绝，**不要**当成多余用例删掉。
+    "fec0::", "fec0::1", "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",  # 站点本地 fec0::/10
+    "192.88.99.0", "192.88.99.2", "192.88.99.255",                  # 6to4 中继 /24
+])
+def test_special_purpose_blocks_flagged_global_are_still_rejected(addr: str):
+    """段首 / 段中 / 段尾都要拒 —— 只测一个地址会漏掉整段。"""
+    assert is_public_address(addr) is False
+
+
+@pytest.mark.parametrize("addr", [
+    "192.88.98.255",  # 紧邻本段之前
+    "192.89.0.0",     # 紧邻本段之后
+    PUBLIC_V4, PUBLIC_V6,
+    "2606:4700::1111",
+])
+def test_neighbours_of_the_special_blocks_are_unaffected(addr: str):
+    """显式网段表不能顺手把邻居也拒掉：拒绝范围要正好等于那一段。"""
+    assert is_public_address(addr) is True
+
+
+@pytest.mark.parametrize("addr", [
+    # stdlib 的 flag 已经覆盖这些，但此前**没有回归用例** —— 缺了它们，
+    # 一旦有人把 is_global 的判定顺序改动，没有任何东西会变红。
+    "100.64.0.1",              # 运营商级 NAT
+    "192.0.2.1", "198.51.100.1", "203.0.113.1",  # 文档用段
+    "198.18.0.1",              # 基准测试段
+    "::ffff:10.0.0.1",         # IPv4-mapped 私网
+    "2002:7f00:1::",           # 6to4 里嵌了 127.0.0.1
+    "2001::1",                 # Teredo
+    "64:ff9b::1",              # NAT64 前缀（当前整体拒绝，见报告 Q4）
+    "2001:db8::1",             # IPv6 文档段
+    "fc00::", "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",  # ULA 段首与段尾
+])
+def test_special_purpose_ranges_covered_by_stdlib_are_rejected(addr: str):
+    assert is_public_address(addr) is False
+
+
+@pytest.mark.parametrize("addr", [
     "8.8.8.8", PUBLIC_V4,
     PUBLIC_V6, "2001:4860:4860::8888",
 ])
@@ -546,3 +586,101 @@ async def test_resolve_and_validate_accepts_literal_addresses():
             downloader._resolver,
         )
     assert exc.value.reason == "blocked_address"
+
+
+# ==========================================================================
+# 总期限必须包住"裸 await"（复核报告 A1）
+# ==========================================================================
+
+async def test_resolver_that_never_returns_hits_the_deadline():
+    """resolver 卡住时，下载器必须**自己**报 timeout —— 不能一直挂着。
+
+    期限原来只在"每跳开始"和"收到 body chunk"处比较，那两个检查点都在裸 await
+    **之外**：resolver 只要不返回，两个点都到不了，协程就永远停在那儿。
+    实测：探针只能靠外层 ``wait_for`` 停住，下载器自己从不报错。
+
+    去掉 ``fetch`` 里的 ``wait_for``，这条会一直挂到 pytest 的 30s 超时 —— 变红。
+    """
+
+    async def _never(host: str, port: int) -> list[str]:
+        await asyncio.Event().wait()  # 永不返回
+        return []
+
+    downloader = SafeDownloader(
+        DownloadPolicy(total_timeout=0.05),
+        resolver=_never,
+        transport_factory=_Recorder().transport,
+    )
+    started = time.monotonic()
+    with pytest.raises(DownloadError) as exc:
+        # 测试自己再加一层 5s 上限。理由：把外层期限注入掉之后（反向测试会这么做），
+        # 这条应当变成**干净的断言失败**，而不是挂到 pytest-timeout 才结束 ——
+        # "卡住"在 CI 上比"失败"贵得多，而且很容易被人靠调大超时糊过去。
+        await asyncio.wait_for(downloader.fetch("https://a.example.com/a.jpg"), 5)
+    assert exc.value.reason == "timeout"
+    # 不能靠上面那层 5s 兜底：必须是下载器自己按时限收手
+    assert time.monotonic() - started < 3
+
+
+# ==========================================================================
+# 内容编码：解压发生在计数之前（复核报告 A2）
+# ==========================================================================
+
+def _gzip_of_repeated_bytes(total: int) -> bytes:
+    import gzip
+
+    return gzip.compress(b"\0" * total)
+
+
+async def test_compressed_response_is_refused_before_it_is_decompressed():
+    """带 ``Content-Encoding`` 的响应必须在**读取之前**拒绝。
+
+    为什么不能只靠"读的时候数字节"：httpx 是先 decode 再 yield
+    （``_models.py`` 先 ``decoder.decode(raw)``，``_decoders.py`` 的 gzip
+    解压没有输出长度上限）。实测：32 MiB 压成 32 KB、预算 1 MiB，
+    最终确实报 ``too_large``，但**此前 Python 分配峰值已到 77.41 MiB**。
+
+    所以断言的是**拒绝的理由**，而不是"最终拒绝了"——
+    只有前者能证明解压根本没发生。
+    """
+    payload = _gzip_of_repeated_bytes(32 * 1024 * 1024)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("accept-encoding") == "identity", (
+            "必须显式要求未压缩的字节：缺了这个头就是在邀请对方压缩响应"
+        )
+        return httpx.Response(200, content=payload, headers={"Content-Encoding": "gzip"})
+
+    downloader = _downloader(
+        _Recorder(handler), {"a.example.com": [PUBLIC_V4]}, max_bytes=1024 * 1024
+    )
+    with pytest.raises(DownloadError) as exc:
+        await downloader.fetch("https://a.example.com/a.jpg")
+    assert exc.value.reason == "unsupported_content_encoding"
+
+
+async def test_large_uncompressed_response_still_reports_too_large():
+    """正对照：不带内容编码的超限响应，仍然按 ``too_large`` 拒绝。
+
+    没有这条，"拒绝得早"可能被实现成"什么都拒绝"。
+    """
+    payload = b"\0" * (4 * 1024 * 1024)
+    downloader = _downloader(
+        _Recorder(lambda r: httpx.Response(200, content=payload)),
+        {"a.example.com": [PUBLIC_V4]},
+        max_bytes=1024 * 1024,
+    )
+    with pytest.raises(DownloadError) as exc:
+        await downloader.fetch("https://a.example.com/a.jpg")
+    assert exc.value.reason == "too_large"
+
+
+@pytest.mark.parametrize("encoding", ["identity", ""])
+async def test_identity_or_absent_encoding_is_accepted(encoding: str):
+    """``identity``（或压根没有这个头）必须放行 —— 否则等于拒绝所有正常图源。"""
+    headers = {"Content-Encoding": encoding} if encoding else {}
+    downloader = _downloader(
+        _Recorder(lambda r: httpx.Response(200, content=b"IMG", headers=headers)),
+        {"a.example.com": [PUBLIC_V4]},
+    )
+    assert await downloader.fetch("https://a.example.com/a.jpg") == b"IMG"

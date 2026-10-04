@@ -30,12 +30,19 @@ import binascii
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Optional
 
-try:
-    from fastmcp import FastMCP
-except ImportError:  # pragma: no cover - 兼容旧路径
-    from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
+from mcp.types import ToolAnnotations
+
+# 为什么**不再**兜底导入 ``mcp.server.fastmcp``：mcp 2.x 已经把它改名成
+# ``mcp.server.mcpserver.MCPServer``（API 也变了）。那条兜底路径在当前依赖下
+# 只会抛 "No module named 'mcp.server.fastmcp'"，把"没装 fastmcp"这个真实原因
+# 掩盖成一条看不出所以然的错误。pyproject 里 ``fastmcp>=4.0`` 是硬依赖，
+# 所以直接硬导入：缺了就是缺了，报错也要报得能看懂。
 
 from PicImageSearch import (
     Ascii2D,
@@ -103,11 +110,112 @@ class SearchInputError(ValueError):
     """调用方输入不合法。与"上游出错"区分开，便于调用方判断该不该重试。"""
 
 
+@dataclass(frozen=True)
+class SearchOutcome:
+    """一次搜索的结果，同时带着"给人看的文本"和"给机器看的结构"。
+
+    为什么不让 ``_search_image_logic`` 直接返回字符串：那样工具层就无法区分
+    "搜到了但没结果"与"搜索失败"，而 MCP 规范要求把后者用 ``isError: true``
+    返回，客户端和模型才能据此自我修正（复核报告 A 的
+    "no result 与 search failed 不可区分"）。
+    """
+
+    text: str
+    structured: dict[str, Any] | None = None
+    is_error: bool = False
+
+
+#: 搜索工具的输出契约。
+#: 只声明**各引擎通用**的四个字段 —— 字段少而形状确定，比字段多而形状不定更有用：
+#: 输出 schema 一旦虚设，客户端就没法真的依赖它。引擎特有字段（episode、
+#: author_url 等）仍然只在文本里。
+SEARCH_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "engine": {"type": "string", "description": "本次实际使用的引擎"},
+        "result_count": {"type": "integer", "description": "上游返回的结果总数"},
+        "returned": {"type": "integer", "description": "本次实际返回的条数"},
+        "truncated": {"type": "boolean", "description": "是否因为 limit 而截断"},
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": ["string", "null"]},
+                    "url": {"type": ["string", "null"]},
+                    "thumbnail": {"type": ["string", "null"]},
+                    "similarity": {
+                        "type": ["number", "string", "null"],
+                        "description": "各引擎口径不一致：可能是数字，也可能是 '95%' 这类字符串",
+                    },
+                },
+                "required": ["title", "url", "thumbnail", "similarity"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["engine", "result_count", "returned", "truncated", "results"],
+}
+
+#: 搜索是**只读**且会访问外部服务；不声明这两点，客户端只能一律当危险操作处理。
+SEARCH_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=True,
+    idempotent_hint=True,
+    open_world_hint=True,
+)
+
+#: 查引擎信息是纯本地的静态文档查询。
+INFO_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=True,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+
+
+def _text_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text or None
+
+
+def _similarity_or_none(value: Any) -> float | str | None:
+    """相似度原样保留，只挡掉布尔与复杂对象。
+
+    ``isinstance(True, int)`` 为真，所以布尔要先排除 —— 否则 ``True`` 会变成
+    ``"True%"`` 那种东西进到结构化输出里。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, str)):
+        return value
+    return None
+
+
+def _structured_results(engine: str, raw: Any, limit: int) -> dict[str, Any]:
+    shown = min(len(raw), limit)
+    return {
+        "engine": engine,
+        "result_count": len(raw),
+        "returned": shown,
+        "truncated": len(raw) > shown,
+        "results": [
+            {
+                "title": _text_or_none(getattr(item, "title", None)),
+                "url": _text_or_none(getattr(item, "url", None)),
+                "thumbnail": _text_or_none(getattr(item, "thumbnail", None)),
+                "similarity": _similarity_or_none(getattr(item, "similarity", None)),
+            }
+            for item in raw[:shown]
+        ],
+    }
+
+
 # --------------------------------------------------------------------------
 # 工具：引擎信息（内容由参数契约生成，不手写副本）
 # --------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(title="查询引擎信息", annotations=INFO_ANNOTATIONS)
 def get_engine_info(engine_name: str = "all") -> str:
     """Get information about supported search engines.
 
@@ -125,8 +233,13 @@ def get_engine_info(engine_name: str = "all") -> str:
         if name.lower() == engine_name.lower():
             return params.engine_details(name)
 
-    return (f"Error: Engine '{engine_name}' not found. "
-            f"Supported: {', '.join(params.CONTRACTS)}")
+    # 按 MCP 规范，"输入不对、模型可以自己改"的失败属于工具执行错误 → isError=true。
+    # 旧写法把 "Error: ..." 当**正常结果**返回，客户端无法与真正的结果区分。
+    # 用 ToolError 而不是让 ValueError 冒出去：后者的消息会被 fastmcp 加上
+    # "Error calling tool 'x': " 前缀（实测），对模型只是噪音。
+    raise ToolError(
+        f"Engine '{engine_name}' not found. Supported: {', '.join(params.CONTRACTS)}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -368,21 +481,31 @@ async def _search_image_logic(
     engine: str = "Yandex",
     extra_params_json: Optional[str] = None,
     limit: int = DEFAULT_LIMIT,
-) -> str:
-    """图片搜索的核心逻辑（与 MCP 工具层分开，便于直接测试）。"""
+) -> SearchOutcome:
+    """图片搜索的核心逻辑（与 MCP 工具层分开，便于直接测试）。
+
+    **失败不抛，而是带 ``is_error`` 返回**：工具层要把它翻成 MCP 的
+    ``isError: true``，而"让异常冒出去"那条路的文本会被 fastmcp 加上
+    ``Error calling tool 'x': `` 前缀（实测），对模型只是噪音。
+
+    错误文本保留 ``Error: `` 前缀是**刻意的**：这样只看文本的客户端行为不变，
+    协议感知的客户端才拿 ``isError`` 做判断 —— 协议升级应当是加法。
+    """
     try:
         return await _run_search(source, engine, extra_params_json, limit)
     except SearchInputError as exc:
-        return f"Error: {exc}"
+        return SearchOutcome(text=f"Error: {exc}", is_error=True)
     except params.ParamError as exc:
-        return f"Error: {exc}"
+        return SearchOutcome(text=f"Error: {exc}", is_error=True)
     except CredentialError as exc:
         message = f"Error: {exc}"
         if exc.hint:
             message += f"\nHint: {exc.hint}"
-        return message
+        return SearchOutcome(text=message, is_error=True)
     except DownloadError as exc:
-        return f"Error: 取图失败 [{exc.reason}] {exc}"
+        return SearchOutcome(
+            text=f"Error: 取图失败 [{exc.reason}] {exc}", is_error=True
+        )
     except Exception as exc:  # noqa: BLE001 - 兜底：对外只给简短信息，细节进日志
         # 旧代码把 traceback.format_exc() 拼进返回值 —— 那会泄露服务端绝对路径，
         # 而且对调用方没有用处。详细堆栈留在日志里。
@@ -390,9 +513,12 @@ async def _search_image_logic(
         # 这里刻意**不拼接 str(exc)**：异常消息里可能带文件路径、URL、凭据片段。
         # 只留异常类型名，够定位是哪一类问题了。
         logger.exception("图片搜索失败 engine=%s", engine)
-        return (
-            f"Error: 搜索过程中发生内部错误（{type(exc).__name__}）。"
-            "详细信息见服务端日志。"
+        return SearchOutcome(
+            text=(
+                f"Error: 搜索过程中发生内部错误（{type(exc).__name__}）。"
+                "详细信息见服务端日志。"
+            ),
+            is_error=True,
         )
 
 
@@ -401,7 +527,7 @@ async def _run_search(
     engine: str,
     extra_params_json: Optional[str],
     limit: Any,
-) -> str:
+) -> SearchOutcome:
     # 1. 先校验调用方输入 —— 顺序很重要：**任何拒绝都要发生在读文件与建网络之前**
     #
     # 引擎名校验排在最前：它比"参数契约不存在"更能说清问题出在哪，
@@ -460,7 +586,13 @@ async def _run_search(
     return _format_response(engine, response, resolved_limit)
 
 
-def _format_response(engine: str, response: Any, limit: int) -> str:
+def _format_response(engine: str, response: Any, limit: int) -> SearchOutcome:
+    """把上游响应同时整理成"人读文本"和"机器可读结构"。
+
+    关于规范里那条"返回结构化内容的工具 SHOULD 同时把序列化 JSON 放进文本块"：
+    它是为了纯文本客户端不丢信息。这里的文本本来就是同一份数据的完整渲染
+    （每个字段都出现了），再塞一份 JSON 只是把 payload 翻倍。所以不重复塞。
+    """
     lines = [f"Search Engine: {engine}"]
 
     raw = getattr(response, "raw", None)
@@ -471,7 +603,12 @@ def _format_response(engine: str, response: Any, limit: int) -> str:
                 f"Hint: '{engine}' 常需要配置该引擎的 cookies 才能绕过机器人验证"
                 f"（见 README 的 Cookies 章节）。"
             )
-        return "\n".join(lines)
+        # **没结果不是错误**：这是一次成功的搜索，只是上游没给结果。
+        # 标成 isError 会让模型去"修"一个并不存在的问题。
+        return SearchOutcome(
+            text="\n".join(lines),
+            structured=_structured_results(engine, [], limit),
+        )
 
     shown = min(len(raw), limit)
     truncated = len(raw) > shown
@@ -483,16 +620,23 @@ def _format_response(engine: str, response: Any, limit: int) -> str:
         lines.append("")
         lines.append(f"--- Result {index} ---")
         lines.append(_format_result_item(item, engine))
-    return "\n".join(lines)
+    return SearchOutcome(
+        text="\n".join(lines),
+        structured=_structured_results(engine, raw, limit),
+    )
 
 
-@mcp.tool()
+@mcp.tool(
+    title="以图搜图",
+    annotations=SEARCH_ANNOTATIONS,
+    output_schema=SEARCH_OUTPUT_SCHEMA,
+)
 async def search_image(
     source: str,
     engine: str = "Yandex",
     extra_params_json: Optional[str] = None,
     limit: int = DEFAULT_LIMIT,
-) -> str:
+) -> ToolResult:
     """
     Perform a reverse image search.
 
@@ -514,4 +658,10 @@ async def search_image(
 
         limit: Max number of results to return (1-50, default: 5).
     """
-    return await _search_image_logic(source, engine, extra_params_json, limit)
+    outcome = await _search_image_logic(source, engine, extra_params_json, limit)
+    if outcome.is_error:
+        # 工具执行错误 → 按 MCP 规范用 isError=true 交回给调用方，让它/模型能自我修正。
+        # 用 ToolError 而不是让裸异常冒出去：后者的文本会被加上
+        # 「Error calling tool 'search_image': 」前缀（实测），对模型只是噪音。
+        raise ToolError(outcome.text)
+    return ToolResult(content=outcome.text, structured_content=outcome.structured)

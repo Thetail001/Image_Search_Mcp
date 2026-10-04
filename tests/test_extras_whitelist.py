@@ -29,6 +29,17 @@ from image_search_mcp import params, server
 CANARY_PATH = "/tmp/asa-canary-not-a-real-secret.txt"
 CANARY_CONTENT = b"CANARY-CONTENT-7f3a91b2-should-never-leave-the-host"
 
+#: ``_search_image_logic`` 现在返回 ``SearchOutcome``（文本 + 结构 + is_error）。
+#: 存个别名让辅助函数用别名调用 —— 批量替换不该把它自己也算进去。
+_search_logic = server._search_image_logic
+
+
+async def _search_text(*args, **kwargs) -> str:
+    """这个文件只关心文本与出站副作用，所以统一取文本那一半。"""
+    outcome = await _search_logic(*args, **kwargs)
+    return outcome.text
+
+
 TRACEMOE_RESPONSE = {
     "frameCount": 1, "error": "", "result": [
         {"anilist": 1, "filename": "f.mkv", "episode": 1, "from": 0.0, "to": 1.0,
@@ -113,7 +124,7 @@ async def test_input_is_applied_after_extras_so_it_cannot_be_overridden(
     )
     source = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"x" * 32).decode()
 
-    await server._search_image_logic(
+    await _search_text(
         source=source, engine="TraceMoe",
         extra_params_json=f'{{"file": "{canary_file}"}}', limit=1,
     )
@@ -145,7 +156,7 @@ async def test_reserved_file_key_never_reaches_the_filesystem(
     monkeypatch.setattr("builtins.open", _spy)
     source = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"x" * 32).decode()
 
-    result = await server._search_image_logic(
+    result = await _search_text(
         source=source, engine="TraceMoe",
         extra_params_json=f'{{"file": "{canary_file}"}}', limit=1,
     )
@@ -158,7 +169,7 @@ async def test_reserved_file_key_never_reaches_the_filesystem(
 async def test_canary_content_never_leaves_the_host(canary_file, trace_moe_mock, monkeypatch):
     """与上面同一条路，直接断言哨兵内容没有出现在任何出站字节里。"""
     source = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"x" * 32).decode()
-    await server._search_image_logic(
+    await _search_text(
         source=source, engine="TraceMoe",
         extra_params_json=f'{{"file": "{canary_file}"}}', limit=1,
     )
@@ -168,7 +179,7 @@ async def test_canary_content_never_leaves_the_host(canary_file, trace_moe_mock,
 async def test_other_reserved_keys_are_rejected_too(trace_moe_mock):
     for key in ["url", "client", "api_key", "cookies", "proxies", "request_kwargs",
                 "base_url"]:
-        result = await server._search_image_logic(
+        result = await _search_text(
             source="https://example.com/a.jpg", engine="TraceMoe",
             extra_params_json=f'{{"{key}": "x"}}', limit=1,
         )
@@ -177,7 +188,7 @@ async def test_other_reserved_keys_are_rejected_too(trace_moe_mock):
 
 
 async def test_unknown_key_is_rejected_before_any_request(trace_moe_mock):
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="Yandex",
         extra_params_json='{"rpt": "imageview"}', limit=1,
     )
@@ -187,7 +198,7 @@ async def test_unknown_key_is_rejected_before_any_request(trace_moe_mock):
 
 @pytest.mark.parametrize("payload", ["[]", "1", '"str"', "[1,2]", "true"])
 async def test_non_object_top_level_is_rejected(trace_moe_mock, payload: str):
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="Yandex",
         extra_params_json=payload, limit=1,
     )
@@ -207,7 +218,7 @@ async def test_json_null_means_no_params_not_an_error(payload: str):
 
 
 async def test_malformed_json_is_rejected(trace_moe_mock):
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="Yandex",
         extra_params_json="{not json", limit=1,
     )
@@ -220,7 +231,7 @@ async def test_malformed_json_is_rejected(trace_moe_mock):
 # ==========================================================================
 
 async def test_valid_extra_params_still_work(trace_moe_mock):
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe",
         extra_params_json='{"cut_borders": false}', limit=1,
     )
@@ -234,7 +245,7 @@ async def test_valid_extra_params_still_work(trace_moe_mock):
 
 async def test_default_search_still_works(trace_moe_mock):
     """没有任何 extra params 的普通调用必须正常。"""
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe", limit=1,
     )
     assert result.startswith("Search Engine: TraceMoe")
@@ -242,7 +253,7 @@ async def test_default_search_still_works(trace_moe_mock):
 
 
 async def test_old_wrong_param_name_is_rejected_with_hint(trace_moe_mock):
-    result = await server._search_image_logic(
+    result = await _search_text(
         source="https://example.com/a.jpg", engine="TraceMoe",
         extra_params_json='{"cutBorders": false}', limit=1,
     )

@@ -147,6 +147,33 @@ def run_one(injection: BugInjection, python: str, workdir: Path, quiet: bool) ->
     if result.returncode == 1:
         test_name = injection.test.split("::", 1)[1]
 
+        # 退出码 1 只说明"有测试没通过"。**收集或夹具崩了同样给 1**（注入把模块改坏、
+        # 导入就炸，整个文件变成一条 ERROR）—— 那等于"跑不起来"，不是"发现了缺陷"。
+        # 所以判据是那条测试落在 pytest 的 FAILED 列表还是 ERROR 列表里，
+        # 而不是"输出里出现过它的名字"。
+        def _ids(prefix: str) -> set[str]:
+            found: set[str] = set()
+            for line in output.splitlines():
+                if line.startswith(prefix):
+                    parts = line.split()
+                    if len(parts) > 1:
+                        found.add(parts[1])
+            return found
+
+        failed_ids = _ids("FAILED ")
+        error_ids = _ids("ERROR ")
+
+        def _names_it(test_id: str) -> bool:
+            # 参数化用例在报告里带 `[参数]` 后缀，所以前缀匹配也算"指名到了它"。
+            return test_id == injection.test or test_id.startswith(injection.test + "[")
+
+        if any(_names_it(i) for i in error_ids):
+            return Outcome(
+                injection, False,
+                "红了，但指定测试是 ERROR（收集/夹具崩了），不是断言失败 —— "
+                f"这不能算抓住缺陷：{tail}",
+            )
+
         # 测试确实跑了：名字要出现在输出里（超时堆栈里也会带）
         if test_name not in output:
             return Outcome(
@@ -166,7 +193,16 @@ def run_one(injection: BugInjection, python: str, workdir: Path, quiet: bool) ->
         if "FAILED" not in output and "failed" not in output:
             return Outcome(injection, False, f"退出码 1 但输出里没有失败记录：{tail}")
 
-        return Outcome(injection, True, "指定测试变红，符合预期")
+        if not any(_names_it(i) for i in failed_ids):
+            # 有失败，但 pytest 的 FAILED 列表里**没有指名**这条测试：
+            # 红的是别的测试，或者输出格式变了。两种都不算干净地抓住。
+            return Outcome(
+                injection, False,
+                f"退出码 1，但 FAILED 列表里没有指名 {injection.test} —— "
+                f"不能确信是这条测试抓的：{tail}",
+            )
+
+        return Outcome(injection, True, "指定测试变红（FAILED 列表指名），符合预期")
 
     if result.returncode in (2, 5):
         return Outcome(
@@ -184,6 +220,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="只跑指定的注入（可重复）")
     parser.add_argument("--python", default=sys.executable, help="用哪个解释器")
     args = parser.parse_args(argv)
+
+    # 解释器路径必须**绝对化**：子进程的 cwd 是临时副本，相对路径到那里就找不着了。
+    # （实测踩过：--python .venv/bin/python 直接 FileNotFoundError。）
+    # 注意**不能**用 resolve()：它会解开 .venv/bin/python 这个符号链接，等于绕开
+    # venv 环境，第三方包装在 venv 里就都找不到了（实测：fastmcp 报 ModuleNotFound）。
+    args.python = str(Path(args.python).expanduser().absolute())
 
     selected = INJECTIONS
     if args.only:

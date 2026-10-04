@@ -107,8 +107,18 @@ def _verify_module_origin(repo: Path, env: dict[str, str], python: str) -> str |
     if result.returncode != 0:
         return f"导入探针失败：{result.stderr.strip()[:400]}"
 
+    lines = [line for line in result.stdout.strip().splitlines() if line]
+
+    # **先数条数**：stdout 为空时下面的循环一次都不进，等于"没验就通过"
+    # （复核报告第 12 问点的就是这个空循环）。探针固定输出四个模块路径。
+    if len(lines) != 4:
+        return (
+            f"导入探针应当输出 4 个模块路径，实际 {len(lines)} 行 —— "
+            f"没验到就不能算通过：{result.stdout.strip()[:300]!r}"
+        )
+
     expected = str(repo.resolve())
-    for line in result.stdout.strip().splitlines():
+    for line in lines:
         if not line.startswith(expected):
             return (
                 "导入到的模块不在临时副本里，跑的是干净代码 —— "

@@ -533,6 +533,98 @@ INJECTIONS: tuple[BugInjection, ...] = (
         test="tests/test_mcp_contract.py::test_no_results_is_not_an_error",
         why="把「没搜到」报成失败，会让模型去修一个并不存在的问题（过度报错也是错）",
     ),
+    # --------------------------------------------- 全仓复核批（P1，2026-10-04）
+    BugInjection(
+        name="upstream-explicit-error-treated-as-no-results",
+        path="src/image_search_mcp/server.py",
+        old=(
+            "    upstream_error = _upstream_error(engine, response)\n"
+            "    if upstream_error is not None:\n"
+            "        return SearchOutcome(\n"
+            '            text=f"Error: {engine} 明确报错 —— {upstream_error}",\n'
+            "            is_error=True,\n"
+            "        )\n"
+        ),
+        new="    # 注入：上游明确报错被忽略 —— 继续走「空 raw = 成功空结果」\n",
+        test=(
+            "tests/test_search_flow.py"
+            "::test_upstream_explicit_error_is_not_reported_as_no_results"
+        ),
+        why=(
+            "上游把失败写进 error/status、结果为空时，明确失败被报成「没搜到」"
+            "（复核报告第 3 问，曾用真 TraceMoeResponse 复现 isError=false）"
+        ),
+    ),
+    BugInjection(
+        name="http-status-error-ignored",
+        path="src/image_search_mcp/server.py",
+        old="    if isinstance(code, int) and not isinstance(code, bool) and code >= 400:\n",
+        new="    if False:  # 注入：上游 HTTP 4xx/5xx 被忽略\n",
+        test=(
+            "tests/test_search_flow.py"
+            "::test_http_error_status_is_an_error_even_with_an_empty_body"
+        ),
+        why="HTTP 层报错被当成成功空结果 —— 与上一条同属「失败被报成没结果」",
+    ),
+    BugInjection(
+        name="response-contract-error-treated-as-no-results",
+        path="src/image_search_mcp/server.py",
+        old=(
+            '    if response is None or not hasattr(response, "raw"):\n'
+            "        return SearchOutcome(\n"
+            "            text=(\n"
+            '                "Error: 上游响应缺少 raw 字段"\n'
+            '                f"（{type(response).__name__}）—— 这是响应契约错误，"\n'
+            '                "不能当成\'没有结果\'。"\n'
+            "            ),\n"
+            "            is_error=True,\n"
+            "        )\n"
+        ),
+        new=(
+            '    if response is None or not hasattr(response, "raw"):\n'
+            "        # 注入：契约错误被当成「没结果」\n"
+            "        return SearchOutcome(\n"
+            '            text="No results found.",\n'
+            "            structured=_structured_results(engine, [], limit),\n"
+            "        )\n"
+        ),
+        test=(
+            "tests/test_search_flow.py"
+            "::test_response_without_raw_is_a_contract_error"
+        ),
+        why="响应形状不对（缺 raw / raw 为 None）时当成「没搜到」，掩盖适配层契约破裂",
+    ),
+    BugInjection(
+        name="proxy-error-echoes-secret",
+        path="src/image_search_mcp/credentials.py",
+        old='            f"{PROXY_VAR} 缺少主机名：{_described_proxy(raw)}",\n',
+        new='            f"{PROXY_VAR} 缺少主机名：{raw!r}",\n',
+        test="tests/test_credentials.py::test_proxy_error_does_not_echo_the_secret",
+        why=(
+            "错误代理 URL 回显 secret：CredentialError 会经 server 的错误出口回给调用方"
+            "（cookie 同类路径当初已修，代理这条漏了 —— 修一个实例没修一类）"
+        ),
+    ),
+    BugInjection(
+        name="duplicate-auth-header-last-wins",
+        path="src/image_search_mcp/main.py",
+        old=(
+            "        duplicated = [\n"
+            "            name\n"
+            '            for name in (b"authorization", b"origin")\n'
+            "            if sum(1 for key, _ in raw_headers if key.lower() == name) > 1\n"
+            "        ]\n"
+        ),
+        new="        duplicated: list[bytes] = []  # 注入：重复头检查被去掉\n",
+        test=(
+            "tests/test_auth_asgi.py"
+            "::test_duplicate_authorization_headers_fail_closed"
+        ),
+        why=(
+            "重复 Authorization 头由头顺序决定放行：dict() 是后者覆盖前者，"
+            "实测「无效在前、有效在后」→ 204 放行（复核报告第 12 问）"
+        ),
+    ),
 )
 
 

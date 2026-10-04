@@ -103,7 +103,31 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        headers = dict(scope.get("headers", []))
+        raw_headers = scope.get("headers", [])
+
+        # 重复的安全相关头必须拒绝，不能"挑一个"。
+        #
+        # ASGI 的头是 [(name, value)] 列表，重复是合法的；而 ``dict(...)`` 是
+        # **后者覆盖前者**，于是"哪个值生效"变成头顺序问题。实测（复核报告第 12 问）：
+        # Authorization 有效在前、无效在后 → 401；反过来无效在前、有效在后 → 204 放行。
+        # 代理链上出现重复头时，两端解读不一致正是经典的绕过手法。所以重复即拒，
+        # 与"畸形头回 400"的既有约定一致。
+        duplicated = [
+            name
+            for name in (b"authorization", b"origin")
+            if sum(1 for key, _ in raw_headers if key.lower() == name) > 1
+        ]
+        if duplicated:
+            await self._send_plain(
+                send,
+                400,
+                "Duplicate "
+                + ", ".join(name.decode() for name in duplicated)
+                + " header: refusing ambiguous requests",
+            )
+            return
+
+        headers = dict(raw_headers)
 
         rejection = self._check_origin(headers)
         if rejection is not None:

@@ -30,6 +30,7 @@ import binascii
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -586,25 +587,103 @@ async def _run_search(
     return _format_response(engine, response, resolved_limit)
 
 
+_UPSTREAM_ERROR_ATTRS: dict[str, tuple[str, ...]] = {
+    # 上游自己报错时把错误存下来的字段（读上游源码确认过的）：
+    # TraceMoeResponse.error；SauceNAOResponse.header.status（0 = 正常）。
+    "TraceMoe": ("error",),
+    "SauceNAO": ("status",),
+}
+
+
+def _redact_upstream(message: str, limit: int = 200) -> str:
+    """上游文本进工具结果前先脱敏截断。
+
+    以 data URI 形式传入的图（Base64）可能被上游的错误信息整段倒回来 ——
+    那不是该回给调用方的东西，也撑爆文本块。
+    """
+    text = re.sub(
+        r"data:[\w.+-]+/[\w.+-]+;base64,[A-Za-z0-9+/=]+", "data:<redacted>", message
+    )
+    text = " ".join(text.split())
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _upstream_error(engine: str, response: Any) -> Optional[str]:
+    """上游**明确**报错了吗？没有明确信号就返回 None。
+
+    为什么必须有这一步：``raw`` 为空有两种截然不同的成因 —— "搜到了但没有匹配"
+    与 "上游明确报错"。旧代码只看 ``if not raw``，把两者都算成成功空结果，
+    于是明确失败被报成 ``is_error=False``（复核报告第 3 问：用真 TraceMoeResponse
+    走完整工具链复现，上游 ``error`` 字段非空却返回 "No results found."）。
+
+    反向的错误也要避免：不能把所有空 raw 都判成失败 —— HTML 引擎空解析可能只是
+    没匹配，凭空断言"触发了机器人验证"同样是假装知道。
+    """
+    if response is None:
+        return None  # 交由调用方按"响应契约错误"处理
+
+    code = getattr(response, "status_code", None)
+    if isinstance(code, int) and not isinstance(code, bool) and code >= 400:
+        return f"上游 HTTP {code}"
+
+    for attr in _UPSTREAM_ERROR_ATTRS.get(engine, ()):
+        value = getattr(response, attr, None)
+        if value in (None, "", 0, "0"):
+            continue
+        return f"上游报错：{_redact_upstream(str(value))}"
+
+    return None
+
+
 def _format_response(engine: str, response: Any, limit: int) -> SearchOutcome:
     """把上游响应同时整理成"人读文本"和"机器可读结构"。
 
     关于规范里那条"返回结构化内容的工具 SHOULD 同时把序列化 JSON 放进文本块"：
-    它是为了纯文本客户端不丢信息。这里的文本本来就是同一份数据的完整渲染
-    （每个字段都出现了），再塞一份 JSON 只是把 payload 翻倍。所以不重复塞。
+    我们**没有**满足它。这是有理由的偏离，但如实记成偏离 —— 机器字段与人读文字
+    并不是同一份键值序列化（值为 null 的字段在文本里根本不出现），
+    所以旧注释那句"每个字段都出现了"站不住。取舍是：文本形态保持不变、
+    不额外提供 JSON 文本镜像；要机器消费的客户端读 ``structuredContent``。
     """
     lines = [f"Search Engine: {engine}"]
 
-    raw = getattr(response, "raw", None)
+    if response is None or not hasattr(response, "raw"):
+        return SearchOutcome(
+            text=(
+                "Error: 上游响应缺少 raw 字段"
+                f"（{type(response).__name__}）—— 这是响应契约错误，"
+                "不能当成'没有结果'。"
+            ),
+            is_error=True,
+        )
+
+    upstream_error = _upstream_error(engine, response)
+    if upstream_error is not None:
+        return SearchOutcome(
+            text=f"Error: {engine} 明确报错 —— {upstream_error}",
+            is_error=True,
+        )
+
+    raw = response.raw
+    if raw is None:
+        return SearchOutcome(
+            text="Error: 上游响应的 raw 是 None —— 这是响应契约错误，不能当成'没有结果'。",
+            is_error=True,
+        )
+
     if not raw:
         lines.append("No results found.")
         if engine in ("Yandex", "Google", "Bing", "GoogleLens", "Tineye"):
+            # 旧文案断言"常需要 cookies 才能绕过机器人验证"——那是猜的，
+            # 对"本来就没收录"、"上游限流"、"引擎缺签名解密"都是误导
+            # （复核报告第 13 问）。改成排查顺序，不替上游下结论。
             lines.append(
-                f"Hint: '{engine}' 常需要配置该引擎的 cookies 才能绕过机器人验证"
-                f"（见 README 的 Cookies 章节）。"
+                "Hint: 没匹配到结果的常见成因有好几种 —— 图太小或太模糊、"
+                "收录该图的站点不在这个引擎的覆盖范围内、上游限流，"
+                "或该引擎确实需要凭据。排查顺序：先看引擎有没有给出明确的失败信息，"
+                "再检查凭据配置（见 README 的 Cookies 章节），"
+                "不要假定一定是机器人验证。"
             )
-        # **没结果不是错误**：这是一次成功的搜索，只是上游没给结果。
-        # 标成 isError 会让模型去"修"一个并不存在的问题。
+        # **没结果不是错误**：这是一次成功、且上游没有明确报错的搜索。
         return SearchOutcome(
             text="\n".join(lines),
             structured=_structured_results(engine, [], limit),

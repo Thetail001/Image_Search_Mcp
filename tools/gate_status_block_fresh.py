@@ -43,8 +43,16 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_DOC = REPO / "docs" / "实施进度.md"
 GENERATOR = REPO / "tools" / "status.py"
 
-#: 这一行随工作区变化，比较时忽略；否则门禁在任何"有未提交文件"时都会红
-VOLATILE = re.compile(r"^-\s*相对基线的改动：")
+#: 这几行是**环境状态**，不是"从产物取到的事实"，比较时必须排除：
+#:
+#: - 「相对基线的改动」随工作区变化，手里有一个没提交的文件就不一样；
+#: - 「分支 / 基线」在 CI 里必然是别的值（分支是 main、且浅克隆里可能没有
+#:   ``origin/main``，生成器会写"（不可用）"）。
+#:
+#: 实测踩过：只忽略第一条时，门禁在本机绿、到 CI 里三个 Python 版本全红 ——
+#: 那正好是"会误报的门禁最后只会被关掉"的形态，所以这条忽略规则也要有反向测试
+#: （见 self_test 的情形 4）。
+VOLATILE = re.compile(r"^\s*-\s*(相对基线的改动：|分支：)")
 
 sys.path.insert(0, str(REPO / "tools"))
 import status as status_module  # noqa: E402  （复用它的标记常量，见模块开头说明）
@@ -157,6 +165,22 @@ def self_test() -> int:
                 else:
                     print(f"情形 2 通过：改旧测试条数被抓到（退出码 {code}）")
 
+        # 情形 4：分支/基线行不同 → 必须**仍然通过**（CI 里就是这种情形）
+        other_branch = tmpdir / "other-branch.md"
+        swapped = re.sub(r"^- 分支：`[^`]*`", "- 分支：`main`", text, count=1, flags=re.M)
+        if swapped == text:
+            failures.append("情形 4 预处理失败：没能改到分支那一行")
+        else:
+            other_branch.write_text(swapped, encoding="utf-8")
+            code = check(other_branch)
+            if code != 0:
+                failures.append(
+                    f"情形 4：只有分支行不同却判不通过（退出码 {code}）"
+                    " —— CI 里分支是 main，这会让门禁误报"
+                )
+            else:
+                print("情形 4 通过：分支行不同不被判为过期（CI 安全）")
+
         # 情形 3：标记被删掉 → 必须响亮失败，不能静默通过
         broken_doc = tmpdir / "broken.md"
         broken_doc.write_text(
@@ -174,7 +198,8 @@ def self_test() -> int:
         for item in failures:
             print(f"  - {item}")
         return 1
-    print("\n反向自检通过：三个情形都符合预期（新鲜通过、改旧被抓、标记缺失响亮失败）")
+    print("\n反向自检通过：四个情形都符合预期"
+          "（新鲜通过、改旧被抓、分支行不同不误报、标记缺失响亮失败）")
     # 自检之后再检查**真实文档**：check.sh 只挂这一个入口，
     # 免得"跑了自检却没跑真检查"——那正好是假门禁的形态。
     print("\n---- 真实文档 ----")

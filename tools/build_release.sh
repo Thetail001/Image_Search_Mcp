@@ -32,6 +32,24 @@ commit_time="$(git log -1 --format=%cI)"
 build() {
   rm -rf dist
   uv build >/dev/null
+  # sdist 的 gzip 头会把"当前时刻"写进 MTIME 字段，于是同一提交两次构建得到不同哈希
+  # （实测：成员清单与成员时间戳完全一致，差的只有 gzip 头里那 4 个字节）。
+  # 这里解压后用自己的固定 mtime 重新压一遍：**包内内容一个字节都不动**，
+  # 只让外层容器变成确定的。
+  python3 - "$SOURCE_DATE_EPOCH" <<'PY'
+import gzip
+import pathlib
+import sys
+
+epoch = int(sys.argv[1])
+for path in sorted(pathlib.Path("dist").glob("*.tar.gz")):
+    raw = gzip.decompress(path.read_bytes())
+    with path.open("wb") as handle:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=handle,
+                           mtime=epoch, compresslevel=9) as gz:
+            gz.write(raw)
+    print(f"已固定 {path.name} 的 gzip MTIME = {epoch}")
+PY
 }
 
 build

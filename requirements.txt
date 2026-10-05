@@ -1,3 +1,8 @@
-fastmcp
-PicImageSearch
-uvicorn
+# 依赖的唯一事实来源是 pyproject.toml 的 [project.dependencies]。
+# 这个文件不再手抄一份 —— 手抄必腐烂：它会漏掉 Starlette 这类直接依赖，
+# 也会和 pyproject 里的版本范围悄悄分歧（之前那 3 行就是这么来的）。
+#
+# 安装：
+#   pip install .          # 运行时依赖
+#   pip install ".[dev]"   # 加上测试依赖
+#   uv sync                # 或者用 uv

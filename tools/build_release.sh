@@ -32,23 +32,39 @@ commit_time="$(git log -1 --format=%cI)"
 build() {
   rm -rf dist
   uv build >/dev/null
-  # sdist 的 gzip 头会把"当前时刻"写进 MTIME 字段，于是同一提交两次构建得到不同哈希
-  # （实测：成员清单与成员时间戳完全一致，差的只有 gzip 头里那 4 个字节）。
-  # 这里解压后用自己的固定 mtime 重新压一遍：**包内内容一个字节都不动**，
-  # 只让外层容器变成确定的。
+  # 两级都不确定，都要处理：
+  #
+  # 1) gzip 头把"当前时刻"写进 MTIME（实测差的只有那 4 个字节）；
+  # 2) 内层 tar 用的是 Python 默认的 pax 扩展头，里面带**亚秒** mtime ——
+  #    生成文件（PKG-INFO / egg-info）的 mtime 带小数，每次构建都不同。
+  #    实测：解开后文件内容、成员顺序、权限属主时间全一致，可内层 tar 哈希就是不同，
+  #    差的全在 pax 头里。
+  #
+  # 所以：按 GNU tar 格式重建外层 tar（归一化 mtime/属主、丢掉 pax 头），
+  # 再用固定 mtime 重新压。**包内文件内容一个字节不动。**
   python3 - "$SOURCE_DATE_EPOCH" <<'PY'
 import gzip
+import io
 import pathlib
 import sys
+import tarfile
 
 epoch = int(sys.argv[1])
 for path in sorted(pathlib.Path("dist").glob("*.tar.gz")):
-    raw = gzip.decompress(path.read_bytes())
+    with tarfile.open(fileobj=io.BytesIO(gzip.decompress(path.read_bytes())), mode="r:") as src:
+        members = src.getmembers()
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w", format=tarfile.GNU_FORMAT) as dst:
+            for member in members:
+                info = member.replace(uid=0, gid=0, uname="", gname="", mtime=epoch)
+                info.pax_headers = {}
+                payload = src.extractfile(member) if member.isfile() else None
+                dst.addfile(info, payload)
     with path.open("wb") as handle:
         with gzip.GzipFile(filename="", mode="wb", fileobj=handle,
                            mtime=epoch, compresslevel=9) as gz:
-            gz.write(raw)
-    print(f"已固定 {path.name} 的 gzip MTIME = {epoch}")
+            gz.write(buffer.getvalue())
+    print(f"已归一化 {path.name}（tar 元数据 + gzip MTIME = {epoch}）")
 PY
 }
 

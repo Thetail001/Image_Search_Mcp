@@ -83,7 +83,7 @@ echo "提交：$(git rev-parse --short HEAD 2>/dev/null || echo '（无 git）')
 
 if [[ $REVERSE_ONLY -eq 0 ]]; then
 
-  step "模块可导入" "$PY" -c "import image_search_mcp, image_search_mcp.main, image_search_mcp.safe_download, image_search_mcp.credentials, image_search_mcp.params; print('ok')"
+  step "模块可导入" "$PY" -c "import image_search_mcp, image_search_mcp.main, image_search_mcp.safe_download, image_search_mcp.credentials, image_search_mcp.params, image_search_mcp.local_input; print('ok')"
 
   # -------------------------------------------------------------------------
   # 2. 单元测试

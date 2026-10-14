@@ -8,7 +8,9 @@ import os
 import secrets
 import sys
 
-from .server import mcp
+from . import local_input
+from .local_input import LocalInputError
+from .server import mcp, register_local_tool
 
 #: 唯一免认证路径。只读、不访问任何引擎（见 /healthz 实现）。
 HEALTH_PATH = "/healthz"
@@ -250,9 +252,26 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if not args.sse:
-        # stdio 模式由调用方（本机进程）拥有管道，不需要 HTTP token
+        # stdio 模式由调用方（本机进程）拥有管道，不需要 HTTP token。
+        # 本机图片输入也只在这里启用：同一个进程同时暴露 HTTP 是配置错误。
+        if local_input.enable_requested():
+            try:
+                roots = local_input.validate_roots()
+            except LocalInputError as exc:
+                raise SystemExit(f"拒绝启动：{exc}") from exc
+            register_local_tool(mcp)
+            print(
+                f"本机图片输入已启用（{len(roots)} 个 allowlist 目录）。仅限 stdio。",
+                file=sys.stderr,
+            )
         mcp.run()
         return
+
+    if local_input.enable_requested():
+        raise SystemExit(
+            "拒绝启动：本机图片输入只允许 stdio 模式；HTTP/SSE 不能暴露本地路径读取。"
+            f" 请去掉 {local_input.ENABLE_VAR}（或改用 stdio）。"
+        )
 
     import uvicorn
 

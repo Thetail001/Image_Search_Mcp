@@ -34,7 +34,8 @@ from PicImageSearch import (
     Yandex,
 )
 
-from . import params
+from . import local_input, params
+from .local_input import LocalInputError
 from .credentials import (
     CredentialError,
     ignored_proxy_vars,
@@ -84,13 +85,31 @@ ALL_CONCURRENCY = 3
 #: 主输入只接受 URL；4096 是产品预算，不是 URL 协议上限。
 MAX_URL_CHARS = 4096
 
-_INPUT_CAPABILITIES = (
-    "Input capabilities: search_image accepts absolute HTTP(S) image URLs only "
-    f"(at most {MAX_URL_CHARS} characters). Local paths, file URIs, data URIs, "
-    "and inline Base64 are unsupported. This server provides no upload or hosting endpoint. "
-    "BaiDu and EHentai URLs are fetched by this MCP server under its download policy; "
-    "other engines receive the URL for upstream retrieval."
-)
+#: 本机 stdio 模式下允许直接吃 ``file: bytes`` 的引擎集合。
+#: 必须由测试对着上游 ``search()`` 签名核对，不能手抄。
+LOCAL_FILE_ENGINES: frozenset[str] = frozenset(ENGINES)
+
+
+def _input_capabilities() -> str:
+    """按当前运行模式生成输入能力说明（远程/本机两套契约）。"""
+    text = (
+        "Input capabilities: search_image accepts absolute HTTP(S) image URLs only "
+        f"(at most {MAX_URL_CHARS} characters). Local paths, file URIs, data URIs, "
+        "and inline Base64 are unsupported. This server provides no upload or hosting endpoint. "
+        "BaiDu and EHentai URLs are fetched by this MCP server under its download policy; "
+        "other engines receive the URL for upstream retrieval."
+    )
+    if local_input.enabled():
+        text += (
+            " Local stdio mode additionally provides search_local_image(path=...): the path must be an "
+            f"absolute regular file under a server-configured allowlist ({local_input.ROOTS_VAR}), "
+            "must not cross a symlink, and must be a JPEG, PNG, or static WebP of at most "
+            f"{local_input.MAX_BYTES // (1024 * 1024)} MiB and "
+            f"{local_input.MAX_PIXELS // 1_000_000} MP. "
+            "Its bytes are read once and disclosed to the selected search providers. "
+            "HTTP/SSE mode never registers local file input."
+        )
+    return text
 
 
 class SearchInputError(ValueError):
@@ -224,17 +243,29 @@ def get_engine_info(engine_name: str = "all") -> str:
                      Default: "all".
     """
     if engine_name.lower() == "all":
+        local_enabled = local_input.enabled()
         lines = ["Supported Search Engines:"]
         lines.append("- All: 查询全部引擎；limit 按每个引擎计算，单个引擎失败不影响其他结果。")
         for name in params.CONTRACTS:
-            lines.append(f"- {name}: {params.engine_brief(name)}")
+            lines.append(f"- {name}: {params.engine_brief(name, local_enabled=local_enabled)}")
+        if local_enabled:
+            lines.append("")
+            lines.append("Local file input support:")
+            for name in params.CONTRACTS:
+                capability = "URL and local file bytes" if name in LOCAL_FILE_ENGINES else "URL only"
+                lines.append(f"- {name}: {capability}")
         lines.append("")
-        lines.append(_INPUT_CAPABILITIES)
+        lines.append(_input_capabilities())
         return "\n".join(lines)
 
+    local_enabled = local_input.enabled()
     for name in params.CONTRACTS:
         if name.lower() == engine_name.lower():
-            return params.engine_details(name) + "\n\n" + _INPUT_CAPABILITIES
+            return (
+                params.engine_details(name, local_enabled=local_enabled)
+                + "\n\n"
+                + _input_capabilities()
+            )
 
     # 使用 ToolError 返回工具执行错误。
     raise ToolError(
@@ -450,6 +481,34 @@ async def _prepare_search_input(
     return {"url": trimmed}
 
 
+def _outcome_for_exception(exc: Exception, engine: Optional[str]) -> SearchOutcome:
+    """把已知异常翻译成对外文本；未知异常只给类型名，细节进日志。"""
+    if isinstance(exc, asyncio.TimeoutError):
+        return SearchOutcome(text="Error: 搜索总期限已到", is_error=True)
+    if isinstance(exc, (SearchInputError, LocalInputError)):
+        return SearchOutcome(text=f"Error: {exc}", is_error=True)
+    if isinstance(exc, params.ParamError):
+        return SearchOutcome(text=f"Error: {exc}", is_error=True)
+    if isinstance(exc, CredentialError):
+        message = f"Error: {exc}"
+        if exc.hint:
+            message += f"\nHint: {exc.hint}"
+        return SearchOutcome(text=message, is_error=True)
+    if isinstance(exc, DownloadError):
+        return SearchOutcome(
+            text=f"Error: 取图失败 [{exc.reason}] {exc}", is_error=True
+        )
+    # 详细堆栈仅写入日志，客户端只接收异常类型。
+    logger.exception("图片搜索失败 engine=%s", engine)
+    return SearchOutcome(
+        text=(
+            f"Error: 搜索过程中发生内部错误（{type(exc).__name__}）。"
+            "详细信息见服务端日志。"
+        ),
+        is_error=True,
+    )
+
+
 async def _search_image_logic(
     source: str,
     engine: Optional[str] = None,
@@ -458,7 +517,7 @@ async def _search_image_logic(
     *,
     _prepared_input: dict[str, Any] | None = None,
 ) -> SearchOutcome:
-    """执行搜索，将输入、配置和上游异常整理成 SearchOutcome。"""
+    """执行 URL 搜索，将输入、配置和上游异常整理成 SearchOutcome。"""
     try:
         # 输入校验必须早于引擎解析与 All 分发：否则 mock/分发层会绕过它。
         _validate_image_url(source)
@@ -469,31 +528,41 @@ async def _search_image_logic(
             _run_search(source, resolved_engine, extra_params_json, limit, prepared_input=_prepared_input),
             SEARCH_TOTAL_TIMEOUT,
         )
-    except asyncio.TimeoutError:
-        return SearchOutcome(text="Error: 搜索总期限已到", is_error=True)
-    except SearchInputError as exc:
-        return SearchOutcome(text=f"Error: {exc}", is_error=True)
-    except params.ParamError as exc:
-        return SearchOutcome(text=f"Error: {exc}", is_error=True)
-    except CredentialError as exc:
-        message = f"Error: {exc}"
-        if exc.hint:
-            message += f"\nHint: {exc.hint}"
-        return SearchOutcome(text=message, is_error=True)
-    except DownloadError as exc:
-        return SearchOutcome(
-            text=f"Error: 取图失败 [{exc.reason}] {exc}", is_error=True
-        )
-    except Exception as exc:  # noqa: BLE001 - 兜底：对外只给简短信息，细节进日志
-        # 详细堆栈仅写入日志，客户端只接收异常类型。
-        logger.exception("图片搜索失败 engine=%s", engine)
-        return SearchOutcome(
-            text=(
-                f"Error: 搜索过程中发生内部错误（{type(exc).__name__}）。"
-                "详细信息见服务端日志。"
+    except Exception as exc:  # noqa: BLE001 - 统一交给 _outcome_for_exception 分流
+        return _outcome_for_exception(exc, engine)
+
+
+async def _search_local_image_logic(
+    path: str,
+    engine: Optional[str] = None,
+    extra_params_json: Optional[str] = None,
+    limit: int = DEFAULT_LIMIT,
+) -> SearchOutcome:
+    """执行本机图片搜索：只读一次字节，再把字节交给引擎。"""
+    try:
+        if not local_input.enabled():
+            raise LocalInputError(
+                "LOCAL_INPUT_DISABLED",
+                "本机图片输入未启用：这只在本机 stdio 模式且配置 allowlist 后可用。",
+            )
+        data = local_input.read_image(path)
+        resolved_engine = _resolve_engine(engine)
+        search_args = {"file": data}
+        if resolved_engine == ALL_ENGINE:
+            return await _run_all_search(None, extra_params_json, limit, prepared_input=search_args)
+        if resolved_engine not in LOCAL_FILE_ENGINES:
+            raise LocalInputError(
+                "ENGINE_INPUT_UNSUPPORTED",
+                f"{resolved_engine} 不支持本机文件字节输入；请换用支持 URL 的 search_image。",
+            )
+        return await asyncio.wait_for(
+            _execute_search(
+                resolved_engine, None, extra_params_json, limit, search_args=search_args,
             ),
-            is_error=True,
+            SEARCH_TOTAL_TIMEOUT,
         )
+    except Exception as exc:  # noqa: BLE001 - 统一交给 _outcome_for_exception 分流
+        return _outcome_for_exception(exc, engine)
 
 
 def _resolve_engine(engine: Optional[str]) -> str:
@@ -529,31 +598,51 @@ def _all_extra_params(raw: Any) -> dict[str, dict[str, Any]]:
     return grouped
 
 
-async def _run_all_search(source: str, raw_extra: Optional[str], limit: Any) -> SearchOutcome:
+async def _run_all_search(
+    source: Optional[str],
+    raw_extra: Optional[str],
+    limit: Any,
+    *,
+    prepared_input: dict[str, Any] | None = None,
+) -> SearchOutcome:
     resolved_limit = _resolve_limit(limit)
     grouped = _all_extra_params(_load_extra_params(raw_extra))
-    if not isinstance(source, str):
-        raise SearchInputError(
-            "[INPUT_URL_REQUIRED] search_image accepts absolute HTTP(S) image URLs only. "
-            "Local paths, file URIs, data URIs, and inline Base64 are unsupported. "
-            "This server provides no upload or hosting endpoint."
-        )
-    trimmed = _validate_image_url(source)
-    prepared = None
+    if prepared_input is None:
+        if not isinstance(source, str):
+            raise SearchInputError(
+                "[INPUT_URL_REQUIRED] search_image accepts absolute HTTP(S) image URLs only. "
+                "Local paths, file URIs, data URIs, and inline Base64 are unsupported. "
+                "This server provides no upload or hosting endpoint."
+            )
+        trimmed: Optional[str] = _validate_image_url(source)
+        engines = dict(ENGINES)
+    else:
+        trimmed = None
+        # 本机模式下只查询公告过支持 file 字节的引擎。
+        engines = {name: cls for name, cls in ENGINES.items() if name in LOCAL_FILE_ENGINES}
     semaphore = asyncio.Semaphore(ALL_CONCURRENCY)
 
     async def run_one(name: str) -> SearchOutcome:
         async with semaphore:
             try:
-                return await asyncio.wait_for(
-                    _search_image_logic(trimmed, name, json.dumps(grouped[name]), resolved_limit,
-                                        _prepared_input=prepared),
-                    ALL_ENGINE_TIMEOUT,
-                )
+                if prepared_input is None:
+                    assert trimmed is not None
+                    call = _run_search(
+                        trimmed, name, json.dumps(grouped[name]), resolved_limit,
+                        prepared_input=None,
+                    )
+                else:
+                    call = _execute_search(
+                        name, None, json.dumps(grouped[name]), resolved_limit,
+                        search_args=prepared_input,
+                    )
+                return await asyncio.wait_for(call, ALL_ENGINE_TIMEOUT)
             except asyncio.TimeoutError:
                 return SearchOutcome(text=f"Error: {name} 搜索超时", is_error=True)
+            except Exception as exc:  # noqa: BLE001 - 单引擎失败不拖垮整次查询
+                return _outcome_for_exception(exc, name)
 
-    tasks = {name: asyncio.create_task(run_one(name)) for name in ENGINES}
+    tasks = {name: asyncio.create_task(run_one(name)) for name in engines}
     try:
         _, pending = await asyncio.wait(tasks.values(), timeout=SEARCH_TOTAL_TIMEOUT)
         for task in pending:
@@ -589,8 +678,15 @@ async def _run_all_search(source: str, raw_extra: Optional[str], limit: Any) -> 
     }
     sections = [outcome.text if outcome.text.startswith("Search Engine: ")
                 else f"Search Engine: {name}\n{outcome.text}" for name, outcome in outcomes]
+    if prepared_input is not None:
+        mode = f"{len(outcomes)} local-file engines"
+        skipped = [name for name in ENGINES if name not in engines]
+        if skipped:
+            sections.insert(0, "Skipped engines (no local file support): " + ", ".join(skipped))
+    else:
+        mode = f"{len(outcomes)} engines"
     return SearchOutcome(
-        text=f"Search Engine: All ({len(outcomes)} engines, limit {resolved_limit} per engine)\n\n"
+        text=f"Search Engine: All ({mode}, limit {resolved_limit} per engine)\n\n"
              + "\n\n".join(sections),
         structured=structured,
         is_error=all_failed,
@@ -605,6 +701,21 @@ async def _run_search(
     *,
     prepared_input: dict[str, Any] | None = None,
 ) -> SearchOutcome:
+    """URL 输入的薄封装；保留这个函数名给调用方与测试做替换点。"""
+    return await _execute_search(
+        engine, source, extra_params_json, limit, search_args=prepared_input,
+    )
+
+
+async def _execute_search(
+    engine: str,
+    source: Optional[str],
+    extra_params_json: Optional[str],
+    limit: Any,
+    *,
+    search_args: dict[str, Any] | None = None,
+) -> SearchOutcome:
+    """执行一次引擎查询；``search_args`` 已定好输入时不再解析 URL。"""
     # 先校验输入，再创建网络请求。
     if engine not in ENGINES:
         raise SearchInputError(
@@ -619,11 +730,11 @@ async def _run_search(
     for reserved in params.RESERVED_KEYS:
         search_kwargs.pop(reserved, None)
 
-    if not isinstance(source, str):
-        raise SearchInputError(f"source 需要字符串，收到 {type(source).__name__}")
-
-    # 2. 准备搜索输入（URL 可能由我们自己抓，见 _prepare_search_input）
-    search_args = prepared_input if prepared_input is not None else await _prepare_search_input(engine, source)
+    if search_args is None:
+        if not isinstance(source, str):
+            raise SearchInputError(f"source 需要字符串，收到 {type(source).__name__}")
+        # 2. 准备搜索输入（URL 可能由我们自己抓，见 _prepare_search_input）
+        search_args = await _prepare_search_input(engine, source)
 
     # 3. 凭据与出站配置
     credentials = load_engine_credentials(engine)
@@ -810,3 +921,73 @@ async def search_image(
         # 使用 ToolError 返回工具执行错误。
         raise ToolError(outcome.text)
     return ToolResult(content=outcome.text, structured_content=outcome.structured)
+
+
+# --------------------------------------------------------------------------
+# 本机 stdio 模式的额外工具（默认不注册）
+# --------------------------------------------------------------------------
+
+#: 已经注册过本机工具的实例 id，避免重复注册。
+_LOCAL_REGISTERED_TARGET_IDS: set[int] = set()
+
+
+async def search_local_image(
+    path: Annotated[str, Field(
+        description=(
+            "Absolute local image path on this machine, at most 4096 characters. "
+            "Only available in local stdio mode and only under the server-configured "
+            "allowlist directories; symlinks are rejected."
+        ),
+    )],
+    engine: Optional[str] = None,
+    extra_params_json: Optional[str] = None,
+    limit: StrictInt = DEFAULT_LIMIT,
+) -> ToolResult:
+    """
+    Reverse image search using a local image file (local stdio mode only).
+
+    This tool exists only when the server runs as a local stdio process with
+    IMAGE_SEARCH_LOCAL_INPUT=1 and IMAGE_SEARCH_LOCAL_ROOTS pointing at one or
+    more allowlist directories. The path must be an absolute regular file
+    inside those directories, must not cross a symlink, and must be a JPEG,
+    PNG, or static WebP of at most 8 MiB. The file bytes are read once and
+    disclosed to the selected search providers; the path itself is not sent.
+
+    HTTP/SSE mode never registers this tool: remote callers must use
+    `search_image` with an absolute HTTP(S) URL.
+
+    Args:
+        path: Absolute local image path under the server's allowlist roots.
+        engine: Same engine names as `search_image`. All queries every engine
+                that accepts local file bytes.
+        extra_params_json: Same engine parameter contract as `search_image`.
+        limit: Max number of results to return (1-50, default: 5).
+    """
+    outcome = await _search_local_image_logic(path, engine, extra_params_json, limit)
+    if outcome.structured is not None and "engine_outcomes" in outcome.structured:
+        return ToolResult(content=outcome.text, structured_content=outcome.structured,
+                          is_error=outcome.is_error)
+    if outcome.is_error:
+        raise ToolError(outcome.text)
+    return ToolResult(content=outcome.text, structured_content=outcome.structured)
+
+
+def register_local_tool(target: FastMCP | None = None) -> bool:
+    """把 ``search_local_image`` 注册到目标实例。
+
+    未启用本机输入（开关或 allowlist 不成立）时什么都不做并返回 False。
+    调用方负责传输模式：``main()`` 只在 stdio 分支调用它，并在 HTTP 模式下
+    直接拒绝这种配置。
+    """
+    if not local_input.enabled():
+        return False
+    destination = target if target is not None else mcp
+    if id(destination) in _LOCAL_REGISTERED_TARGET_IDS:
+        return True
+    destination.tool(
+        title="以图搜图（本机图片）",
+        annotations=SEARCH_ANNOTATIONS,
+        output_schema=SEARCH_OUTPUT_SCHEMA,
+    )(search_local_image)
+    _LOCAL_REGISTERED_TARGET_IDS.add(id(destination))
+    return True

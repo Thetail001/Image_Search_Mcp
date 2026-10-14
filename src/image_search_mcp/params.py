@@ -293,19 +293,25 @@ _STATUS_LABEL = {
 }
 
 
-def engine_brief(engine: str) -> str:
+def engine_brief(engine: str, *, local_enabled: bool = False) -> str:
     contract = CONTRACTS[engine]
     label = _STATUS_LABEL.get(contract.status, "")
-    text = f"{label}{_BRIEFS.get(engine, engine)}输入：仅绝对 HTTP(S) 图片 URL。"
+    if local_enabled:
+        inputs = (
+            "输入：绝对 HTTP(S) 图片 URL；本机 stdio 模式下还可用 search_local_image 读 allowlist 内的本地路径。"
+        )
+    else:
+        inputs = "输入：仅绝对 HTTP(S) 图片 URL。"
+    text = f"{label}{_BRIEFS.get(engine, engine)}{inputs}"
     if contract.note:
         text += contract.note
     return text
 
 
-def engine_details(engine: str) -> str:
+def engine_details(engine: str, *, local_enabled: bool = False) -> str:
     """根据参数定义生成单个引擎的说明。"""
     contract = CONTRACTS[engine]
-    lines = [f"=== {engine} ===", f"Brief: {engine_brief(engine)}"]
+    lines = [f"=== {engine} ===", f"Brief: {engine_brief(engine, local_enabled=local_enabled)}"]
 
     if contract.init or contract.search:
         lines.append("")

@@ -48,19 +48,19 @@ INJECTIONS: tuple[BugInjection, ...] = (
         name="error-leaks-exception-text",
         path="src/image_search_mcp/server.py",
         old=(
-            "        return SearchOutcome(\n"
-            "            text=(\n"
-            '                f"Error: 搜索过程中发生内部错误（{type(exc).__name__}）。"\n'
-            '                "详细信息见服务端日志。"\n'
-            "            ),\n"
-            "            is_error=True,\n"
-            "        )"
+            "    return SearchOutcome(\n"
+            "        text=(\n"
+            '            f"Error: 搜索过程中发生内部错误（{type(exc).__name__}）。"\n'
+            '            "详细信息见服务端日志。"\n'
+            "        ),\n"
+            "        is_error=True,\n"
+            "    )"
         ),
         new=(
-            "        return SearchOutcome(\n"
-            '            text=f"Error: 内部错误（{type(exc).__name__}）: {exc}",\n'
-            "            is_error=True,\n"
-            "        )"
+            "    return SearchOutcome(\n"
+            '        text=f"Error: 内部错误（{type(exc).__name__}）: {exc}",\n'
+            "        is_error=True,\n"
+            "    )"
         ),
         test=(
             "tests/test_search_flow.py"
@@ -465,8 +465,14 @@ INJECTIONS: tuple[BugInjection, ...] = (
     BugInjection(
         name="bare-exception-instead-of-tool-error",
         path="src/image_search_mcp/server.py",
-        old="        raise ToolError(outcome.text)",
-        new="        raise ValueError(outcome.text)  # 注入：用裸异常",
+        old=(
+            "        # 使用 ToolError 返回工具执行错误。\n"
+            "        raise ToolError(outcome.text)"
+        ),
+        new=(
+            "        # 使用 ToolError 返回工具执行错误。\n"
+            "        raise ValueError(outcome.text)  # 注入：用裸异常"
+        ),
         test=(
             "tests/test_mcp_contract.py"
             "::test_error_text_does_not_gain_a_tool_name_prefix"
@@ -476,8 +482,16 @@ INJECTIONS: tuple[BugInjection, ...] = (
     BugInjection(
         name="structured-content-dropped",
         path="src/image_search_mcp/server.py",
-        old="    return ToolResult(content=outcome.text, structured_content=outcome.structured)",
-        new="    return ToolResult(content=outcome.text)  # 注入：不给结构化内容",
+        old=(
+            "        # 使用 ToolError 返回工具执行错误。\n"
+            "        raise ToolError(outcome.text)\n"
+            "    return ToolResult(content=outcome.text, structured_content=outcome.structured)"
+        ),
+        new=(
+            "        # 使用 ToolError 返回工具执行错误。\n"
+            "        raise ToolError(outcome.text)\n"
+            "    return ToolResult(content=outcome.text)  # 注入：不给结构化内容"
+        ),
         test=(
             "tests/test_mcp_contract.py"
             "::test_successful_search_returns_structured_content_and_keeps_the_text"
@@ -627,8 +641,26 @@ INJECTIONS: tuple[BugInjection, ...] = (
     BugInjection(
         name="mcp-limit-coercion-enabled",
         path="src/image_search_mcp/server.py",
-        old="    limit: StrictInt = DEFAULT_LIMIT,",
-        new="    limit: int = DEFAULT_LIMIT,",
+        old=(
+            '            "Absolute HTTP(S) image URL reachable by the selected fetcher without "\n'
+            '            "additional request credentials, at most 4096 characters. Local paths, "\n'
+            '            "file URIs, data URIs, and inline Base64 are unsupported by this tool."\n'
+            "        ),\n"
+            "    )],\n"
+            "    engine: Optional[str] = None,\n"
+            "    extra_params_json: Optional[str] = None,\n"
+            "    limit: StrictInt = DEFAULT_LIMIT,"
+        ),
+        new=(
+            '            "Absolute HTTP(S) image URL reachable by the selected fetcher without "\n'
+            '            "additional request credentials, at most 4096 characters. Local paths, "\n'
+            '            "file URIs, data URIs, and inline Base64 are unsupported by this tool."\n'
+            "        ),\n"
+            "    )],\n"
+            "    engine: Optional[str] = None,\n"
+            "    extra_params_json: Optional[str] = None,\n"
+            "    limit: int = DEFAULT_LIMIT,"
+        ),
         test=(
             "tests/test_mcp_contract.py"
             "::test_mcp_rejects_non_integer_limits_before_search[True]"
@@ -684,8 +716,8 @@ INJECTIONS: tuple[BugInjection, ...] = (
     BugInjection(
         name="all-engine-timeout-removed",
         path="src/image_search_mcp/server.py",
-        old="                    ALL_ENGINE_TIMEOUT,",
-        new="                    SEARCH_TOTAL_TIMEOUT,",
+        old="                return await asyncio.wait_for(call, ALL_ENGINE_TIMEOUT)",
+        new="                return await asyncio.wait_for(call, SEARCH_TOTAL_TIMEOUT)",
         test="tests/test_multi_engine.py::test_all_timeouts_cancel_pending_work[1.0-0.04]",
         why="单个慢引擎占满总期限，排队引擎无法执行",
     ),
@@ -704,6 +736,116 @@ INJECTIONS: tuple[BugInjection, ...] = (
         new="        is_error=False,",
         test="tests/test_multi_engine.py::test_all_failures_are_a_structured_tool_error",
         why="全部引擎失败时仍将整个调用标记为成功",
+    ),
+    # ------------------------------------------------------- 批次：本机图片输入
+    BugInjection(
+        name="local-path-containment-removed",
+        path="src/image_search_mcp/local_input.py",
+        old='    raise LocalInputError("INPUT_PATH_DENIED", "path 不在允许读取的图片目录内。")',
+        new="    return roots[0]  # 注入：去掉 allowlist containment 检查",
+        test="tests/test_local_input.py::test_path_outside_configured_roots_is_denied",
+        why="任意文件读取：模型传入 allowlist 之外的路径也被接受",
+    ),
+    BugInjection(
+        name="local-symlink-components-followed",
+        path="src/image_search_mcp/local_input.py",
+        old=(
+            "        if stat.S_ISLNK(info.st_mode):\n"
+            '            raise LocalInputError(code, "路径中包含符号链接，已拒绝。")'
+        ),
+        new=(
+            "        if False:\n"
+            '            raise LocalInputError(code, "路径中包含符号链接，已拒绝。")'
+        ),
+        test="tests/test_local_input.py::test_symlink_component_check_is_a_real_gate",
+        why="符号链接逃逸：第一道逐段 lstat 检查失效（第二道 openat 仍会兜，但这层必须自己成立）",
+    ),
+    BugInjection(
+        name="local-openat-nofollow-removed",
+        path="src/image_search_mcp/local_input.py",
+        old=(
+            '            flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)'
+        ),
+        new=(
+            '            flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NONBLOCK", 0)'
+        ),
+        test="tests/test_local_input.py::test_open_beneath_refuses_symlink_components",
+        why="TOCTOU/符号链接逃逸：逐段 openat 丢了 O_NOFOLLOW，符号链接目录会被跟随",
+    ),
+    BugInjection(
+        name="local-size-limit-removed",
+        path="src/image_search_mcp/local_input.py",
+        old=(
+            "def _enforce_size_limit(size: int) -> None:\n"
+            "    if size > MAX_BYTES:\n"
+            '        raise LocalInputError("INPUT_FILE_TOO_LARGE", f"图片超过 {MAX_BYTES} 字节上限。")'
+        ),
+        new=(
+            "def _enforce_size_limit(size: int) -> None:\n"
+            "    if False:\n"
+            '        raise LocalInputError("INPUT_FILE_TOO_LARGE", f"图片超过 {MAX_BYTES} 字节上限。")'
+        ),
+        test="tests/test_local_input.py::test_file_larger_than_budget_is_rejected",
+        why="内存放大：超大文件被整块读进进程",
+    ),
+    BugInjection(
+        name="local-image-limits-removed",
+        path="src/image_search_mcp/local_input.py",
+        old=(
+            "    if width * height > MAX_PIXELS or max(width, height) > MAX_EDGE:\n"
+            "        raise LocalInputError(\n"
+            '            "INPUT_IMAGE_LIMIT_EXCEEDED",'
+        ),
+        new=(
+            "    if False:\n"
+            "        raise LocalInputError(\n"
+            '            "INPUT_IMAGE_LIMIT_EXCEEDED",'
+        ),
+        test="tests/test_local_input.py::test_pixel_budget_is_enforced",
+        why="解码炸弹：像素与单边上限失效，畸形大图仍被接受",
+    ),
+    BugInjection(
+        name="local-http-mode-allowed",
+        path="src/image_search_mcp/main.py",
+        old=(
+            "    if local_input.enable_requested():\n"
+            "        raise SystemExit(\n"
+            '            "拒绝启动：本机图片输入只允许 stdio 模式；HTTP/SSE 不能暴露本地路径读取。"\n'
+            '            f" 请去掉 {local_input.ENABLE_VAR}（或改用 stdio）。"\n'
+            "        )"
+        ),
+        new=(
+            "    if local_input.enable_requested():\n"
+            "        pass  # 注入：HTTP/SSE 也放行本地图片输入"
+        ),
+        test="tests/test_local_tool_contract.py::test_sse_refuses_to_start_with_local_input_enabled",
+        why="远程暴露本机文件读取：HTTP/SSE 进程也能拿到本地图片能力",
+    ),
+    BugInjection(
+        name="local-tool-not-registered",
+        path="src/image_search_mcp/main.py",
+        old="            register_local_tool(mcp)",
+        new="            pass  # 注入：不注册本机工具",
+        test="tests/test_local_tool_contract.py::test_stdio_registers_local_tool_only_when_enabled",
+        why="配置了本机输入却从不注册工具，能力静默失效",
+    ),
+    BugInjection(
+        name="local-capability-always-advertised",
+        path="src/image_search_mcp/local_input.py",
+        old=(
+            "def enabled() -> bool:\n"
+            '    """本机图片输入是否可用：显式开启 + allowlist 有效。"""\n'
+            "    if not enable_requested():\n"
+            "        return False"
+        ),
+        new=(
+            "def enabled() -> bool:\n"
+            '    """本机图片输入是否可用：显式开启 + allowlist 有效。"""\n'
+            "    if not enable_requested():\n"
+            "        return True"
+        ),
+        test="tests/test_local_tool_contract.py::test_engine_info_hides_local_capability_by_default",
+        why="能力公告撒谎：远程部署也宣称本机图片能力",
     ),
 )
 

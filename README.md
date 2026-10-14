@@ -101,6 +101,7 @@ SSE 地址为 `/sse`，消息端点为 `/messages/`。远程 MCP 配置格式取
 | `IMAGE_SEARCH_API_KEY` | SauceNAO API Key |
 | `IMAGE_SEARCH_COOKIES_<ENGINE>` | 指定引擎的 Cookies，后缀使用大写引擎名，如 `YANDEX`、`EHENTAI` |
 | `IMAGE_SEARCH_PROXY` | 搜索引擎请求使用的代理，如 `http://127.0.0.1:7890` |
+| `IMAGE_SEARCH_DEFAULT_ENGINE` | 未指定 `engine` 时使用的引擎，默认 `Yandex`；可设为 `All` |
 | `IMAGE_SEARCH_ALLOWED_ORIGINS` | 允许的浏览器来源，逗号分隔，如 `https://client.example` |
 | `IMAGE_SEARCH_ALLOW_ANONYMOUS` | 设为 `1` 时开启仅限回环地址的匿名 HTTP 调试模式 |
 
@@ -124,7 +125,7 @@ Cookies 只发送给对应引擎的域名，并且仅通过 HTTPS 发送。旧�
 | 参数 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `source` | string | 必填 | `http://` / `https://` 图片 URL、Base64 或 `data:image/...;base64,...` |
-| `engine` | string | `Yandex` | 使用上表中的名称，区分大小写 |
+| `engine` | string 或 null | 环境配置或 `Yandex` | 名称不区分大小写；`All` 查询全部引擎；省略或 null 时使用默认引擎 |
 | `extra_params_json` | string 或 null | null | 引擎参数的 JSON 字符串；省略、空字符串和 JSON `null` 均表示不传参数 |
 | `limit` | integer | 5 | 返回条数，范围为 1–50 |
 
@@ -153,6 +154,21 @@ Ascii2D 特征搜索示例：
 }
 ```
 
+All 查询示例：
+
+```json
+{
+  "engine": "All",
+  "source": "https://example.com/image.jpg",
+  "extra_params_json": "{\"bovw\": true, \"cut_borders\": false}",
+  "limit": 3
+}
+```
+
+All 模式的 `limit` 按每个引擎计算。附加参数只传给支持该参数的引擎，例如 `bovw` 传给 Ascii2D，`cut_borders` 传给 TraceMoe；未知参数、保留键和错误类型会在查询开始前被拒绝。
+
+每个引擎使用独立客户端与自身凭据。每次 All 查询最多并发 3 个引擎，单个引擎限时 20 秒，整次查询限时 60 秒；总期限到达时保留已完成的结果，并取消剩余任务。单引擎查询同样有 60 秒总期限。
+
 EHentai 和 BaiDu 的 URL 输入由本机下载，再以图片字节提交给引擎。下载限制为 8 MiB、15 秒、最多 3 次重定向；非公网地址、HTTPS 降级和非 identity 内容编码会被拒绝。其他引擎直接把 URL 交给搜索站点抓取。
 
 成功搜索的 `structuredContent` 包含：
@@ -166,6 +182,10 @@ EHentai 和 BaiDu 的 URL 输入由本机下载，再以图片字节提交给引
 | `results` | 每项含 `title`、`url`、`thumbnail`、`similarity`，缺失值为 null |
 
 相似度的单位和格式因引擎而异。引擎专属字段保留在文本结果中。
+
+All 模式还返回 `engine_outcomes`，记录每个引擎的 `success`、`no_results` 或 `error` 状态和错误信息。汇总 `results` 中的每项增加 `engine` 字段；汇总条数为各引擎之和，未去重。`all_failed` 表示是否全部失败。
+
+部分引擎失败时，其他引擎的结果照常返回；只有全部失败时，整次调用才返回 `isError=true`。空结果仍视为成功。
 
 没有匹配结果时返回成功状态和空列表；输入、配置或明确的上游错误返回 `isError=true`。空结果不一定表示需要 Cookies，可先检查图片是否可访问、是否被裁剪，再尝试其他引擎。
 
@@ -196,6 +216,8 @@ bash image_search_mcp_deploy.sh --replace-unit
 
 `.env` 按单行 `KEY=value` 格式读取，支持单引号与双引号；变量引用和命令替换均按字面值处理。配置与备份文件应妥善保管。
 
+配置流程可选择默认引擎，也可以直接设置 `IMAGE_SEARCH_DEFAULT_ENGINE`。默认值在每次调用时读取；显式传入的 `engine` 优先。
+
 ## 开发
 
 ```bash
@@ -214,7 +236,7 @@ python -m venv .venv
 | `python tools/status.py --update docs/实施进度.md` | 更新文档中的测试统计 |
 | `tools/build_release.sh --check` | 构建 wheel 与 sdist，并检查重复构建的哈希；需要 uv 和干净的 Git 工作区 |
 
-运行依赖以 `pyproject.toml` 为准。PicImageSearch 的受支持范围为 `>=3.12.11,<3.13`，FastMCP 为 `>=4.0,<5`；升级范围前需通过参数契约、网络集成和 MCP 协议测试。部署时可另行锁定确切版本。
+运行依赖以 `pyproject.toml` 为准。PicImageSearch 的受支持范围为 `>=3.12.11,<3.13`，FastMCP 为 `>=4.0.10,<5`；升级范围前需通过参数契约、网络集成和 MCP 协议测试。部署时可另行锁定确切版本。
 
 发布前运行完整检查与构建验证，再用隔离环境安装生成的 wheel。确认版本号尚未发布后，使用 `twine upload dist/*` 上传。
 

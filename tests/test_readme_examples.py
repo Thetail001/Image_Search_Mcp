@@ -52,7 +52,7 @@ def test_readme_has_at_least_one_search_example():
 
 def test_readme_examples_use_known_engines():
     for line_number, example in _search_examples():
-        assert example["engine"] in server.ENGINES, (
+        assert example["engine"] in {*server.ENGINES, server.ALL_ENGINE}, (
             f"README 第 {line_number} 行的引擎 {example['engine']!r} 不存在"
         )
 
@@ -68,8 +68,11 @@ def test_readme_examples_have_valid_extra_params():
             "（MCP 工具签名如此），不要在文档里写成嵌套对象"
         )
         try:
-            params.validate_extra_params(example["engine"], json.loads(raw))
-        except params.ParamError as exc:
+            if example["engine"] == server.ALL_ENGINE:
+                server._all_extra_params(json.loads(raw))
+            else:
+                params.validate_extra_params(example["engine"], json.loads(raw))
+        except (params.ParamError, server.SearchInputError) as exc:
             pytest.fail(
                 f"README 第 {line_number} 行的示例参数通不过契约：{exc}\n"
                 "文档里的参数名必须与上游签名一致，否则读者照着抄会拿到报错"

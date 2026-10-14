@@ -56,7 +56,7 @@ load_env() {
         key="${BASH_REMATCH[1]}"
         value="${BASH_REMATCH[2]}"
         case "$key" in
-            HOST|PORT|MCP_AUTH_TOKEN|IMAGE_SEARCH_API_KEY|IMAGE_SEARCH_PROXY) ;;
+            HOST|PORT|MCP_AUTH_TOKEN|IMAGE_SEARCH_API_KEY|IMAGE_SEARCH_PROXY|IMAGE_SEARCH_DEFAULT_ENGINE) ;;
             *) continue ;;
         esac
         value="${value#"${value%%[![:space:]]*}"}"
@@ -307,20 +307,30 @@ if [ -n "$NEW_COOKIE_ENGINE" ]; then
     [ -z "$COOKIE_VALUE" ] && fail "选了引擎却没给 cookies 值；不想改就留空引擎名"
 fi
 
+read -r -p "请输入默认引擎（留空保留 ${IMAGE_SEARCH_DEFAULT_ENGINE:-Yandex}，All=全部引擎）: " NEW_DEFAULT_ENGINE
+REQUESTED_DEFAULT=${NEW_DEFAULT_ENGINE:-${IMAGE_SEARCH_DEFAULT_ENGINE:-Yandex}}
+IMAGE_SEARCH_DEFAULT_ENGINE=""
+for engine_name in SauceNAO Google TraceMoe Ascii2D BaiDu Bing EHentai GoogleLens Iqdb Tineye Yandex All; do
+    if [[ "${engine_name,,}" == "${REQUESTED_DEFAULT,,}" ]]; then
+        IMAGE_SEARCH_DEFAULT_ENGINE="$engine_name"
+        break
+    fi
+done
+[[ -n "$IMAGE_SEARCH_DEFAULT_ENGINE" ]] || fail "默认引擎无效；使用支持的引擎名或 All"
+
 # 只替换脚本管理的键，保留其他配置。
 PRESERVED=""
 if [ -f "$ENV_PATH" ]; then
     PRESERVED=$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_PATH" \
-        | grep -vE '^(HOST|PORT|MCP_AUTH_TOKEN|IMAGE_SEARCH_API_KEY|IMAGE_SEARCH_PROXY)=' \
+        | grep -vE '^(HOST|PORT|MCP_AUTH_TOKEN|IMAGE_SEARCH_API_KEY|IMAGE_SEARCH_PROXY|IMAGE_SEARCH_DEFAULT_ENGINE)=' \
         | grep -vE "^${COOKIE_KEY:-IMAGE_SEARCH_COOKIES_NEVER}=" \
         || true)
 fi
 
-# 旧式的全局 cookies 若没有归属键，服务会拒绝启动。保留它是对的（不能偷偷删凭据），
-# 但必须说出来，否则人只会看到"服务起不来"。
+# 旧全局 Cookies 保留原值，但使用前必须明确归属。
 if printf '%s\n' "$PRESERVED" | grep -q '^IMAGE_SEARCH_COOKIES='; then
     echo "警告: 旧的全局 IMAGE_SEARCH_COOKIES 已原样保留；它需要 IMAGE_SEARCH_COOKIES_ENGINE" >&2
-    echo "      指明归属，否则服务会拒绝启动 —— 建议改用引擎专属的 IMAGE_SEARCH_COOKIES_<ENGINE>。" >&2
+    echo "      指明归属，否则搜索调用会拒绝使用它；建议改用 IMAGE_SEARCH_COOKIES_<ENGINE>。" >&2
 fi
 
 {
@@ -332,6 +342,7 @@ fi
     echo "# 搜图引擎可选配置"
     echo "IMAGE_SEARCH_API_KEY=$(env_quote "$IMAGE_SEARCH_API_KEY")"
     echo "IMAGE_SEARCH_PROXY=$(env_quote "$IMAGE_SEARCH_PROXY")"
+    echo "IMAGE_SEARCH_DEFAULT_ENGINE=$(env_quote "$IMAGE_SEARCH_DEFAULT_ENGINE")"
     if [ -n "$COOKIE_KEY" ]; then
         echo "${COOKIE_KEY}=$(env_quote "$COOKIE_VALUE")"
     fi

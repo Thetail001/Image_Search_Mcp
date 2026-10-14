@@ -24,7 +24,7 @@ classifiers = [
     "Topic :: Multimedia :: Graphics",
 ]
 dependencies = [
-    "fastmcp>=4.0,<5",
+    "fastmcp>=4.0.10,<5",
     # 参数签名和 httpx client 集成以 3.12.11 为基线。
     "PicImageSearch>=3.12.11,<3.13",
     "httpx>=0.28,<0.29",

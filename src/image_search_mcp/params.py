@@ -296,7 +296,7 @@ _STATUS_LABEL = {
 def engine_brief(engine: str) -> str:
     contract = CONTRACTS[engine]
     label = _STATUS_LABEL.get(contract.status, "")
-    text = f"{label}{_BRIEFS.get(engine, engine)}输入：图片 URL 或 Base64。"
+    text = f"{label}{_BRIEFS.get(engine, engine)}输入：仅绝对 HTTP(S) 图片 URL。"
     if contract.note:
         text += contract.note
     return text

@@ -13,6 +13,7 @@ from image_search_mcp import server
 
 
 NAMES = ("Yandex", "TraceMoe", "Ascii2D")
+IMAGE_URL = "https://example.com/a.jpg"
 
 
 def success(name, count=1, limit=5):
@@ -32,43 +33,43 @@ def selected_engines(monkeypatch):
     ("yandex", "Ascii2D", "Yandex"),
     ("Yandex", "Unknown", "Yandex"),
 ])
-async def test_default_engine_and_explicit_override(monkeypatch, png_base64, engine, configured, expected):
+async def test_default_engine_and_explicit_override(monkeypatch, engine, configured, expected):
     monkeypatch.setenv(server.DEFAULT_ENGINE_ENV, configured)
 
     async def run(source, name, extras, limit, **kwargs):
         return success(name)
 
     monkeypatch.setattr(server, "_run_search", run)
-    result = await server._search_image_logic(png_base64, engine)
+    result = await server._search_image_logic(IMAGE_URL, engine)
     assert result.structured["engine"] == expected
 
 
-async def test_default_is_resolved_at_each_call(monkeypatch, png_base64):
+async def test_default_is_resolved_at_each_call(monkeypatch):
     async def run(source, name, extras, limit, **kwargs):
         return success(name)
 
     monkeypatch.setattr(server, "_run_search", run)
     for name in ("Yandex", "Ascii2D"):
         monkeypatch.setenv(server.DEFAULT_ENGINE_ENV, name)
-        result = await server._search_image_logic(png_base64)
+        result = await server._search_image_logic(IMAGE_URL)
         assert result.structured["engine"] == name
 
 
-async def test_default_can_select_all(monkeypatch, selected_engines, png_base64):
+async def test_default_can_select_all(monkeypatch, selected_engines):
     monkeypatch.setenv(server.DEFAULT_ENGINE_ENV, "All")
 
     async def run(source, name, extras, limit, **kwargs):
         return success(name)
 
     monkeypatch.setattr(server, "_run_search", run)
-    result = await server._search_image_logic(png_base64)
+    result = await server._search_image_logic(IMAGE_URL)
     assert result.structured["engine"] == "All"
     assert {item["engine"] for item in result.structured["engine_outcomes"]} == set(NAMES)
 
 
-async def test_invalid_default_is_rejected_before_search(monkeypatch, png_base64):
+async def test_invalid_default_is_rejected_before_search(monkeypatch):
     monkeypatch.setenv(server.DEFAULT_ENGINE_ENV, "Unknown")
-    result = await server._search_image_logic(png_base64)
+    result = await server._search_image_logic(IMAGE_URL)
     assert result.is_error
     assert "不支持的引擎" in result.text
 
@@ -78,7 +79,7 @@ async def test_invalid_default_is_rejected_before_search(monkeypatch, png_base64
     {"bovw": "true"}, [], 1,
 ])
 async def test_all_invalid_parameters_are_rejected_before_any_engine(
-    monkeypatch, selected_engines, png_base64, extra,
+    monkeypatch, selected_engines, extra,
 ):
     called = []
 
@@ -87,39 +88,29 @@ async def test_all_invalid_parameters_are_rejected_before_any_engine(
         return success("Yandex")
 
     monkeypatch.setattr(server, "_run_search", run)
-    result = await server._search_image_logic(png_base64, "All", json.dumps(extra))
+    result = await server._search_image_logic(IMAGE_URL, "All", json.dumps(extra))
     assert result.is_error
     assert not called
 
 
-async def test_all_routes_parameters_and_decodes_base64_once(monkeypatch, selected_engines, png_base64):
+async def test_all_routes_parameters_and_passes_the_url_through(monkeypatch, selected_engines):
     calls = {}
-    decoded = []
-    original = server._decode_image_source
-
-    def decode(value):
-        data = original(value)
-        decoded.append(data)
-        return data
 
     async def run(source, name, extras, limit, *, prepared_input):
-        calls[name] = (json.loads(extras), prepared_input["file"])
+        calls[name] = (source, json.loads(extras), prepared_input)
         return success(name)
 
-    monkeypatch.setattr(server, "_decode_image_source", decode)
     monkeypatch.setattr(server, "_run_search", run)
     result = await server._search_image_logic(
-        png_base64, "all", '{"bovw": true, "cut_borders": false}',
+        IMAGE_URL, "all", '{"bovw": true, "cut_borders": false}',
     )
     assert not result.is_error
-    assert len(decoded) == 1
-    assert calls["Yandex"][0] == {}
-    assert calls["Ascii2D"][0] == {"bovw": True}
-    assert calls["TraceMoe"][0] == {"cut_borders": False}
-    assert all(data is decoded[0] for _, data in calls.values())
+    assert calls["Yandex"] == (IMAGE_URL, {}, None)
+    assert calls["Ascii2D"] == (IMAGE_URL, {"bovw": True}, None)
+    assert calls["TraceMoe"] == (IMAGE_URL, {"cut_borders": False}, None)
 
 
-async def test_all_keeps_partial_failures_and_no_results(monkeypatch, selected_engines, png_base64):
+async def test_all_keeps_partial_failures_and_no_results(monkeypatch, selected_engines):
     async def run(source, name, extras, limit, **kwargs):
         if name == "TraceMoe":
             raise RuntimeError("private-secret")
@@ -127,7 +118,7 @@ async def test_all_keeps_partial_failures_and_no_results(monkeypatch, selected_e
 
     monkeypatch.setattr(server, "_run_search", run)
     async with Client(server.mcp) as client:
-        result = await client.call_tool_mcp("search_image", {"source": png_base64, "engine": "All", "limit": 1})
+        result = await client.call_tool_mcp("search_image", {"source": IMAGE_URL, "engine": "All", "limit": 1})
     data = result.structured_content
     assert not result.is_error
     assert data["result_count"] == 3 and data["returned"] == 1 and data["truncated"]
@@ -137,20 +128,20 @@ async def test_all_keeps_partial_failures_and_no_results(monkeypatch, selected_e
     Draft202012Validator(server.SEARCH_OUTPUT_SCHEMA).validate(data)
 
 
-async def test_all_failures_are_a_structured_tool_error(monkeypatch, selected_engines, png_base64):
+async def test_all_failures_are_a_structured_tool_error(monkeypatch, selected_engines):
     async def run(*args, **kwargs):
         raise RuntimeError("private-secret")
 
     monkeypatch.setattr(server, "_run_search", run)
     async with Client(server.mcp) as client:
-        result = await client.call_tool_mcp("search_image", {"source": png_base64, "engine": "All"})
+        result = await client.call_tool_mcp("search_image", {"source": IMAGE_URL, "engine": "All"})
     assert result.is_error
     assert result.structured_content["all_failed"]
     assert len(result.structured_content["engine_outcomes"]) == len(NAMES)
     Draft202012Validator(server.SEARCH_OUTPUT_SCHEMA).validate(result.structured_content)
 
 
-async def test_total_timeout_preserves_completed_results(monkeypatch, selected_engines, png_base64):
+async def test_total_timeout_preserves_completed_results(monkeypatch, selected_engines):
     monkeypatch.setattr(server, "SEARCH_TOTAL_TIMEOUT", 0.04)
 
     async def run(source, name, extras, limit, **kwargs):
@@ -159,14 +150,14 @@ async def test_total_timeout_preserves_completed_results(monkeypatch, selected_e
         return success(name)
 
     monkeypatch.setattr(server, "_run_search", run)
-    result = await server._search_image_logic(png_base64, "All")
+    result = await server._search_image_logic(IMAGE_URL, "All")
     assert not result.is_error
     assert result.structured["returned"] == 1
     assert result.structured["results"][0]["engine"] == "Yandex"
     assert [item["status"] for item in result.structured["engine_outcomes"]] == ["success", "error", "error"]
 
 
-async def test_all_uses_separate_clients_and_scoped_credentials(monkeypatch, mock_http, png_base64):
+async def test_all_uses_separate_clients_and_scoped_credentials(monkeypatch, mock_http):
     clients = []
     requests = []
     names = ("Yandex", "Ascii2D")
@@ -192,7 +183,7 @@ async def test_all_uses_separate_clients_and_scoped_credentials(monkeypatch, moc
         return httpx.Response(200)
 
     mock_http(handler)
-    result = await server._search_image_logic(png_base64, "All")
+    result = await server._search_image_logic(IMAGE_URL, "All")
     assert not result.is_error
     assert len({id(client) for client in clients}) == 2
     assert all(client.is_closed for client in clients)
@@ -201,7 +192,7 @@ async def test_all_uses_separate_clients_and_scoped_credentials(monkeypatch, moc
     }
 
 
-async def test_all_bounds_concurrency(monkeypatch, selected_engines, png_base64):
+async def test_all_bounds_concurrency(monkeypatch, selected_engines):
     active = maximum = 0
     monkeypatch.setattr(server, "ALL_CONCURRENCY", 2)
 
@@ -216,14 +207,14 @@ async def test_all_bounds_concurrency(monkeypatch, selected_engines, png_base64)
             active -= 1
 
     monkeypatch.setattr(server, "_run_search", run)
-    result = await server._search_image_logic(png_base64, "All")
+    result = await server._search_image_logic(IMAGE_URL, "All")
     assert not result.is_error
     assert maximum == 2 and active == 0
 
 
 @pytest.mark.parametrize("total_timeout,engine_timeout", [(0.04, 1.0), (1.0, 0.04)])
 async def test_all_timeouts_cancel_pending_work(
-    monkeypatch, selected_engines, png_base64, total_timeout, engine_timeout,
+    monkeypatch, selected_engines, total_timeout, engine_timeout,
 ):
     active = 0
     started = []
@@ -242,7 +233,7 @@ async def test_all_timeouts_cancel_pending_work(
             active -= 1
 
     monkeypatch.setattr(server, "_run_search", run)
-    result = await server._search_image_logic(png_base64, "All")
+    result = await server._search_image_logic(IMAGE_URL, "All")
     assert result.is_error and result.structured["all_failed"]
     assert all("超时" in item["error"] or "期限" in item["error"]
                for item in result.structured["engine_outcomes"])
@@ -250,7 +241,7 @@ async def test_all_timeouts_cancel_pending_work(
     assert len(started) == (1 if total_timeout < engine_timeout else len(NAMES))
 
 
-async def test_single_search_has_a_total_deadline(monkeypatch, png_base64):
+async def test_single_search_has_a_total_deadline(monkeypatch):
     monkeypatch.setattr(server, "SEARCH_TOTAL_TIMEOUT", 0.04)
 
     async def run(*args, **kwargs):
@@ -258,7 +249,7 @@ async def test_single_search_has_a_total_deadline(monkeypatch, png_base64):
         return success("Yandex")
 
     monkeypatch.setattr(server, "_run_search", run)
-    result = await server._search_image_logic(png_base64, "Yandex")
+    result = await server._search_image_logic(IMAGE_URL, "Yandex")
     assert result.is_error and "期限" in result.text
 
 

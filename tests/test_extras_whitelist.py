@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import base64
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from image_search_mcp import params, server
+
+IMAGE_URL = "https://example.com/a.jpg"
 
 #: 一个不可能真实存在的路径，用来当哨兵
 CANARY_PATH = "/tmp/asa-canary-not-a-real-secret.txt"
@@ -92,24 +94,29 @@ async def test_control_upstream_read_file_would_exfiltrate_any_path(
     )
 
 
-async def test_input_is_applied_after_extras_so_it_cannot_be_overridden(
-    canary_file, trace_moe_mock, monkeypatch
-):
-    """第二层防御：即使白名单被绕过，输入也不可能被 extras 覆盖。"""
+async def test_input_is_applied_after_extras_so_it_cannot_be_overridden(monkeypatch):
+    """第二层防御：即使白名单被绕过，保留键也不能活着进入引擎调用。"""
     monkeypatch.setattr(
         params, "validate_extra_params",
         lambda engine, raw: ({}, dict(raw or {})),   # 旧行为：原样透传
     )
-    source = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"x" * 32).decode()
+    seen = {}
 
-    await _search_text(
-        source=source, engine="TraceMoe",
-        extra_params_json=f'{{"file": "{canary_file}"}}', limit=1,
+    class FakeTraceMoe:
+        def __init__(self, client=None, **kwargs):
+            pass
+
+        async def search(self, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(raw=[])
+
+    monkeypatch.setattr(server, "ENGINES", {"TraceMoe": FakeTraceMoe})
+    result = await server._search_image_logic(
+        IMAGE_URL, "TraceMoe", '{"file": "/tmp/asa-canary-not-a-real-secret.txt"}', 1,
     )
 
-    assert CANARY_CONTENT not in _uploaded_bodies(trace_moe_mock), (
-        "输入应用顺序错了：extras 里的 file 覆盖了真正的输入"
-    )
+    assert not result.is_error
+    assert seen == {"url": IMAGE_URL}, f"保留键进入了引擎调用：{seen}"
 
 
 # ==========================================================================
@@ -132,7 +139,7 @@ async def test_reserved_file_key_never_reaches_the_filesystem(
         return real_open(file, *args, **kwargs)
 
     monkeypatch.setattr("builtins.open", _spy)
-    source = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"x" * 32).decode()
+    source = IMAGE_URL
 
     result = await _search_text(
         source=source, engine="TraceMoe",
@@ -146,7 +153,7 @@ async def test_reserved_file_key_never_reaches_the_filesystem(
 
 async def test_canary_content_never_leaves_the_host(canary_file, trace_moe_mock, monkeypatch):
     """与上面同一条路，直接断言哨兵内容没有出现在任何出站字节里。"""
-    source = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"x" * 32).decode()
+    source = IMAGE_URL
     await _search_text(
         source=source, engine="TraceMoe",
         extra_params_json=f'{{"file": "{canary_file}"}}', limit=1,

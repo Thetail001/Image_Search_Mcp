@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 
 import httpx
@@ -57,10 +56,6 @@ def http_log(mock_http):
 
     mock_http(handler)
     return seen, state
-
-
-def _png_b64(extra: bytes = b"") -> str:
-    return base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"x" * 32 + extra).decode()
 
 
 # ==========================================================================
@@ -189,45 +184,32 @@ async def test_remote_fetch_engine_passes_the_url_through():
         assert result == {"url": "https://example.com/a.jpg"}, engine
 
 
-async def test_base64_source_becomes_bytes():
-    result = await server._prepare_search_input("TraceMoe", _png_b64())
-    assert isinstance(result["file"], bytes)
-    assert result["file"].startswith(b"\x89PNG")
-
-
-async def test_data_uri_is_accepted():
-    result = await server._prepare_search_input(
-        "TraceMoe", f"data:image/png;base64,{_png_b64()}"
-    )
-    assert result["file"].startswith(b"\x89PNG")
-
-
 @pytest.mark.parametrize("bad", [
     "!!!!not base64!!!!",
     "",
     "   ",
-    "data:image/png;utf8,hello",          # 不是 base64 data URI
-    "data:image/png;base64",              # 缺逗号
-    "data:image/png;base64,",             # 解码后为空
+    "/tmp/a.png",
+    "file:///tmp/a.png",
+    "data:image/png;base64,AAAA",
 ])
-async def test_bad_base64_source_is_rejected(bad: str):
+async def test_non_url_source_is_rejected_before_preparing(bad: str):
     with pytest.raises(server.SearchInputError):
         await server._prepare_search_input("TraceMoe", bad)
 
 
-async def test_bad_base64_is_reported_through_the_public_entry(http_log):
+async def test_non_url_source_is_reported_through_the_public_entry(http_log):
     result = await _search_text(
-        source="!!!!not base64!!!!", engine="TraceMoe", limit=1
+        source="!!!!", engine="TraceMoe", limit=1
     )
-    assert result.startswith("Error:")
-    assert "Base64" in result
+    assert result.startswith("Error: [INPUT_URL_REQUIRED]")
+    assert "unsupported" in result
     assert http_log[0] == [], "输入不合法时不该发出任何请求"
 
 
-async def test_oversized_base64_is_rejected_before_decoding(http_log):
-    huge = "A" * (server.MAX_IMAGE_BYTES // 3 * 4 + 1000)
+async def test_oversized_url_is_rejected_before_any_request(http_log):
+    huge = "https://example.com/" + "A" * 5000
     result = await _search_text(source=huge, engine="TraceMoe", limit=1)
-    assert "上限" in result
+    assert result.startswith("Error: [INPUT_URL_TOO_LONG]")
     assert http_log[0] == []
 
 

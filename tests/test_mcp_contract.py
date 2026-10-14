@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import httpx
 import pytest
 from fastmcp import Client
@@ -11,9 +10,7 @@ from jsonschema import Draft202012Validator
 from image_search_mcp import server
 from image_search_mcp.server import SEARCH_OUTPUT_SCHEMA
 
-#: 最小合法 PNG 头 + 填充，够走到"发请求"那一步
-PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 32
-SOURCE = base64.b64encode(PNG).decode()
+IMAGE_URL = "https://example.com/a.jpg"
 
 TRACEMOE_RESPONSE = {
     "frameCount": 1,
@@ -157,7 +154,7 @@ def test_output_schema_rejects_broken_payloads(broken):
 async def test_successful_search_returns_structured_content_and_keeps_the_text(trace_moe):
     async with Client(server.mcp) as client:
         result = await client.call_tool_mcp(
-            "search_image", {"source": SOURCE, "engine": "TraceMoe", "limit": 1}
+            "search_image", {"source": IMAGE_URL, "engine": "TraceMoe", "limit": 1}
         )
 
     assert result.is_error is False
@@ -177,10 +174,10 @@ async def test_successful_search_returns_structured_content_and_keeps_the_text(t
 
 
 @pytest.mark.parametrize(("arguments", "expected"), [
-    ({"source": SOURCE, "engine": "NotAnEngine"}, "不支持的引擎"),
-    ({"source": "", "engine": "TraceMoe"}, "source 为空"),
-    ({"source": SOURCE, "engine": "TraceMoe", "limit": 0}, "limit"),
-    ({"source": SOURCE, "engine": "TraceMoe", "extra_params_json": "{not json"}, "不是合法 JSON"),
+    ({"source": IMAGE_URL, "engine": "NotAnEngine"}, "不支持的引擎"),
+    ({"source": "", "engine": "TraceMoe"}, "INPUT_URL_REQUIRED"),
+    ({"source": IMAGE_URL, "engine": "TraceMoe", "limit": 0}, "limit"),
+    ({"source": IMAGE_URL, "engine": "TraceMoe", "extra_params_json": "{not json"}, "不是合法 JSON"),
 ])
 async def test_input_rejections_come_back_as_is_error(trace_moe, arguments: dict, expected: str):
     """输入类失败必须是 ``isError: true``。"""
@@ -196,7 +193,7 @@ async def test_mcp_rejects_non_integer_limits_before_search(trace_moe, limit):
     seen, _ = trace_moe
     async with Client(server.mcp) as client:
         result = await client.call_tool_mcp(
-            "search_image", {"source": SOURCE, "engine": "TraceMoe", "limit": limit}
+            "search_image", {"source": IMAGE_URL, "engine": "TraceMoe", "limit": limit}
         )
 
     assert result.is_error is True
@@ -207,7 +204,7 @@ async def test_error_text_does_not_gain_a_tool_name_prefix(trace_moe):
     """用 ``ToolError`` 而不是让裸异常冒出去。"""
     async with Client(server.mcp) as client:
         result = await client.call_tool_mcp(
-            "search_image", {"source": SOURCE, "engine": "NotAnEngine"}
+            "search_image", {"source": IMAGE_URL, "engine": "NotAnEngine"}
         )
 
     text = _text_of(result)
@@ -222,7 +219,7 @@ async def test_no_results_is_not_an_error(trace_moe):
 
     async with Client(server.mcp) as client:
         result = await client.call_tool_mcp(
-            "search_image", {"source": SOURCE, "engine": "TraceMoe", "limit": 5}
+            "search_image", {"source": IMAGE_URL, "engine": "TraceMoe", "limit": 5}
         )
 
     assert result.is_error is False
@@ -246,7 +243,7 @@ async def test_truncation_is_visible_in_the_structured_result(trace_moe):
 
     async with Client(server.mcp) as client:
         result = await client.call_tool_mcp(
-            "search_image", {"source": SOURCE, "engine": "TraceMoe", "limit": 2}
+            "search_image", {"source": IMAGE_URL, "engine": "TraceMoe", "limit": 2}
         )
 
     assert result.is_error is False

@@ -1,6 +1,6 @@
 # Image Search MCP
 
-基于 [PicImageSearch](https://github.com/kitUIN/PicImageSearch) 的以图搜图 MCP 服务。支持图片 URL、Base64 和 Base64 data URI，提供 stdio 与 SSE 两种连接方式。
+基于 [PicImageSearch](https://github.com/kitUIN/PicImageSearch) 的以图搜图 MCP 服务。主工具只接受绝对 HTTP(S) 图片 URL，不提供上传或托管端点；本地路径、`file:` URI、Base64 和 Base64 data URI 均不受支持。提供 stdio 与 SSE 两种连接方式。
 
 搜索结果包含标题、来源链接、缩略图和相似度；部分引擎还会返回作者、番剧集数或时间点。结果同时提供文本和 `structuredContent`。
 
@@ -124,12 +124,14 @@ Cookies 只发送给对应引擎的域名，并且仅通过 HTTPS 发送。旧�
 
 | 参数 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `source` | string | 必填 | `http://` / `https://` 图片 URL、Base64 或 `data:image/...;base64,...` |
+| `source` | string | 必填 | 绝对 `http://` / `https://` 图片 URL，最长 4096 字符 |
 | `engine` | string 或 null | 环境配置或 `Yandex` | 名称不区分大小写；`All` 查询全部引擎；省略或 null 时使用默认引擎 |
 | `extra_params_json` | string 或 null | null | 引擎参数的 JSON 字符串；省略、空字符串和 JSON `null` 均表示不传参数 |
 | `limit` | integer | 5 | 返回条数，范围为 1–50 |
 
-Base64 解码后上限为 16 MiB。不接受本地文件路径。
+`source` 只接受 URL。本地文件路径、`file:` URI、Base64、`data:image/...;base64,...` 和带 userinfo / fragment / 非法端口的 URL 会在任何引擎请求发出前被拒绝；错误使用稳定错误码（`INPUT_URL_REQUIRED`、`INPUT_URL_INVALID`、`INPUT_URL_TOO_LONG`），不回显输入内容。服务没有上传或托管端点；只有本地图片而没有现成可用 URL 时，这个工具不能搜索它。
+
+URL 会交给所选搜图提供方；其中 EHentai 和 BaiDu 的 URL 由本机按下载策略取回图片字节后再提交，其他引擎直接接收 URL 去抓取。
 
 `extra_params_json` 只接受该引擎支持的参数。未知参数、错误类型和由服务端管理的键（如 `file`、`url`、`api_key`、`cookies`、`proxies`）会被拒绝。参数列表由 `get_engine_info` 提供。
 
@@ -191,7 +193,7 @@ All 模式还返回 `engine_outcomes`，记录每个引擎的 `success`、`no_re
 
 ### `get_engine_info`
 
-`engine_name` 默认为 `all`，返回全部引擎的简要说明。传入引擎名时返回该引擎的参数、默认值及支持状态。
+`engine_name` 默认为 `all`，返回全部引擎的简要说明。传入引擎名时返回该引擎的参数、默认值及支持状态。两种返回都会附带当前输入能力说明（URL-only、无上传端点、哪些引擎由服务端代抓）。
 
 ```json
 {

@@ -164,12 +164,3 @@ def seen_requests() -> list[httpx.Request]:
 # --------------------------------------------------------------------------
 # 常用测试数据
 # --------------------------------------------------------------------------
-
-#: 一个结构合法的最小 PNG 头（不是完整图片，够测试走到出站阶段）
-PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
-
-
-@pytest.fixture
-def png_base64() -> str:
-    import base64
-    return base64.b64encode(PNG_BYTES).decode()

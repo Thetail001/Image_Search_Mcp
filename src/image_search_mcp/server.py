@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
-import base64
 import asyncio
-import binascii
 import json
 import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
+from urllib.parse import urlsplit
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
-from pydantic import StrictInt
+from pydantic import Field, StrictInt
 
 # FastMCP 是直接依赖，缺失时直接报告导入错误。
 
@@ -82,10 +81,16 @@ SEARCH_TOTAL_TIMEOUT = 60.0
 ALL_ENGINE_TIMEOUT = 20.0
 ALL_CONCURRENCY = 3
 
-#: 输入图片解码后的上限（Base64 长度按 4/3 反推，留一点余量）
-MAX_IMAGE_BYTES = 16 * 1024 * 1024
+#: 主输入只接受 URL；4096 是产品预算，不是 URL 协议上限。
+MAX_URL_CHARS = 4096
 
-_DATA_URI_PREFIX = "data:"
+_INPUT_CAPABILITIES = (
+    "Input capabilities: search_image accepts absolute HTTP(S) image URLs only "
+    f"(at most {MAX_URL_CHARS} characters). Local paths, file URIs, data URIs, "
+    "and inline Base64 are unsupported. This server provides no upload or hosting endpoint. "
+    "BaiDu and EHentai URLs are fetched by this MCP server under its download policy; "
+    "other engines receive the URL for upstream retrieval."
+)
 
 
 class SearchInputError(ValueError):
@@ -223,11 +228,13 @@ def get_engine_info(engine_name: str = "all") -> str:
         lines.append("- All: 查询全部引擎；limit 按每个引擎计算，单个引擎失败不影响其他结果。")
         for name in params.CONTRACTS:
             lines.append(f"- {name}: {params.engine_brief(name)}")
+        lines.append("")
+        lines.append(_INPUT_CAPABILITIES)
         return "\n".join(lines)
 
     for name in params.CONTRACTS:
         if name.lower() == engine_name.lower():
-            return params.engine_details(name)
+            return params.engine_details(name) + "\n\n" + _INPUT_CAPABILITIES
 
     # 使用 ToolError 返回工具执行错误。
     raise ToolError(
@@ -329,39 +336,55 @@ def _format_result_item(item: Any, engine: str) -> str:
 # 输入解析
 # --------------------------------------------------------------------------
 
-def _decode_image_source(source: str) -> bytes:
-    """把 Base64 / data URI 解码成字节，并做长度与合法性校验。"""
+def _validate_image_url(source: str) -> str:
+    """校验主输入：只接受绝对 HTTP(S) URL，返回原样字符串。"""
     if not isinstance(source, str) or not source.strip():
-        raise SearchInputError("source 为空")
+        raise SearchInputError(
+            "[INPUT_URL_REQUIRED] search_image accepts absolute HTTP(S) image URLs only. "
+            "Local paths, file URIs, data URIs, and inline Base64 are unsupported. "
+            "This server provides no upload or hosting endpoint."
+        )
 
-    payload = source.strip()
-    if payload.lower().startswith(_DATA_URI_PREFIX):
-        # 只接受 "data:<mediatype>;base64,<payload>" 这一种形态
-        if "," not in payload:
-            raise SearchInputError("data URI 缺少 ',' 分隔符")
-        header, payload = payload.split(",", 1)
-        if ";base64" not in header.lower():
-            raise SearchInputError("data URI 必须是 base64 编码（缺少 ';base64'）")
+    trimmed = source.strip()
+    if len(trimmed) > MAX_URL_CHARS:
+        raise SearchInputError(
+            f"[INPUT_URL_TOO_LONG] source exceeds the {MAX_URL_CHARS}-character URL limit. "
+            "A shorter authorized image URL is required; removing signature parameters can invalidate access."
+        )
 
-    # 反推上限，避免先把超长输入整个解码进内存
-    if len(payload) > (MAX_IMAGE_BYTES // 3 + 1) * 4:
-        raise SearchInputError(f"Base64 输入超过上限（解码后上限 {MAX_IMAGE_BYTES} 字节）")
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in trimmed):
+        raise SearchInputError(
+            "[INPUT_URL_INVALID] source is not a supported absolute HTTP(S) URL. "
+            "A non-empty host and a valid port are required; whitespace, control characters, "
+            "URL userinfo, and fragments are unsupported."
+        )
 
     try:
-        decoded = base64.b64decode(payload, validate=True)
-    except (binascii.Error, ValueError) as exc:
+        parts = urlsplit(trimmed)
+        # 访问 .port 会让坏端口在这里炸出来，而不是留给下游。
+        _ = parts.port
+    except ValueError as exc:
         raise SearchInputError(
-            "source 既不是 http(s) URL，也不是合法 Base64；"
-            f"解码失败：{exc}"
+            "[INPUT_URL_INVALID] source is not a supported absolute HTTP(S) URL. "
+            "A non-empty host and a valid port are required; whitespace, control characters, "
+            "URL userinfo, and fragments are unsupported."
         ) from exc
 
-    if not decoded:
-        raise SearchInputError("解码后的图片数据为空")
+    if parts.scheme.lower() not in {"http", "https"}:
+        raise SearchInputError(
+            "[INPUT_URL_REQUIRED] search_image accepts absolute HTTP(S) image URLs only. "
+            "Local paths, file URIs, data URIs, and inline Base64 are unsupported. "
+            "This server provides no upload or hosting endpoint."
+        )
 
-    if len(decoded) > MAX_IMAGE_BYTES:
-        raise SearchInputError(f"图片数据超过上限 {MAX_IMAGE_BYTES} 字节")
+    if not parts.hostname or parts.username is not None or parts.password is not None or parts.fragment:
+        raise SearchInputError(
+            "[INPUT_URL_INVALID] source is not a supported absolute HTTP(S) URL. "
+            "A non-empty host and a valid port are required; whitespace, control characters, "
+            "URL userinfo, and fragments are unsupported."
+        )
 
-    return decoded
+    return trimmed
 
 
 def _resolve_limit(limit: Any) -> int:
@@ -417,10 +440,7 @@ async def _prepare_search_input(
     source: str,
 ) -> dict[str, Any]:
     """准备图片输入。EHentai 和 BaiDu 的 URL 由安全下载器取回，其余引擎直接接收 URL。"""
-    trimmed = source.strip()
-
-    if not trimmed.lower().startswith(("http://", "https://")):
-        return {"file": _decode_image_source(trimmed)}
+    trimmed = _validate_image_url(source)
 
     if engine in ENGINES_THAT_FETCH_LOCALLY:
         downloader = _make_downloader()
@@ -440,6 +460,8 @@ async def _search_image_logic(
 ) -> SearchOutcome:
     """执行搜索，将输入、配置和上游异常整理成 SearchOutcome。"""
     try:
+        # 输入校验必须早于引擎解析与 All 分发：否则 mock/分发层会绕过它。
+        _validate_image_url(source)
         resolved_engine = _resolve_engine(engine)
         if resolved_engine == ALL_ENGINE:
             return await _run_all_search(source, extra_params_json, limit)
@@ -511,11 +533,13 @@ async def _run_all_search(source: str, raw_extra: Optional[str], limit: Any) -> 
     resolved_limit = _resolve_limit(limit)
     grouped = _all_extra_params(_load_extra_params(raw_extra))
     if not isinstance(source, str):
-        raise SearchInputError("source 需要字符串")
-    trimmed = source.strip()
-    prepared = None if trimmed.lower().startswith(("http://", "https://")) else {
-        "file": _decode_image_source(trimmed)
-    }
+        raise SearchInputError(
+            "[INPUT_URL_REQUIRED] search_image accepts absolute HTTP(S) image URLs only. "
+            "Local paths, file URIs, data URIs, and inline Base64 are unsupported. "
+            "This server provides no upload or hosting endpoint."
+        )
+    trimmed = _validate_image_url(source)
+    prepared = None
     semaphore = asyncio.Semaphore(ALL_CONCURRENCY)
 
     async def run_one(name: str) -> SearchOutcome:
@@ -590,6 +614,10 @@ async def _run_search(
     resolved_limit = _resolve_limit(limit)
     raw_extra = _load_extra_params(extra_params_json)
     init_kwargs, search_kwargs = params.validate_extra_params(engine, raw_extra)
+
+    # 纵深防御：即使白名单被绕过/替换，保留键也不能活着走到输入装配。
+    for reserved in params.RESERVED_KEYS:
+        search_kwargs.pop(reserved, None)
 
     if not isinstance(source, str):
         raise SearchInputError(f"source 需要字符串，收到 {type(source).__name__}")
@@ -734,22 +762,35 @@ def _format_response(engine: str, response: Any, limit: int) -> SearchOutcome:
     output_schema=SEARCH_OUTPUT_SCHEMA,
 )
 async def search_image(
-    source: str,
+    source: Annotated[str, Field(
+        description=(
+            "Absolute HTTP(S) image URL reachable by the selected fetcher without "
+            "additional request credentials, at most 4096 characters. Local paths, "
+            "file URIs, data URIs, and inline Base64 are unsupported by this tool."
+        ),
+    )],
     engine: Optional[str] = None,
     extra_params_json: Optional[str] = None,
     limit: StrictInt = DEFAULT_LIMIT,
 ) -> ToolResult:
     """
-    Perform a reverse image search.
+    Reverse image search using an absolute HTTP(S) image URL.
+
+    This tool accepts URLs only. Local paths, file URIs, data URIs, and
+    inline Base64 are unsupported. This server provides no upload or hosting endpoint.
+
+    A local image requires an existing, authorized file-to-HTTP workflow that
+    produces an image URL reachable by the selected fetcher without additional
+    request credentials. Without such a workflow or an existing suitable URL,
+    this tool cannot search a local image. A URL reachable only on the agent's
+    machine is insufficient.
+
+    BaiDu and EHentai images are fetched by this MCP server under its download
+    policy. Other engines receive the URL for upstream retrieval. Image URLs
+    or bytes are disclosed to the selected search providers.
 
     Args:
-        source: The image input.
-                1. If you have a public image URL, use the URL.
-                2. If you have image data, use a Base64 encoded string
-                   (a `data:image/...;base64,...` data URI also works).
-                3. Do NOT provide a local file path — the server does not read
-                   local files, and such input is rejected.
-
+        source: Absolute HTTP(S) image URL, at most 4096 characters.
         engine: The search engine to use. If omitted or null, use IMAGE_SEARCH_DEFAULT_ENGINE,
                 falling back to Yandex. Names are case-insensitive. All queries every engine.
                 Other supported engines: SauceNAO, Google, TraceMoe, Ascii2D, EHentai, etc.

@@ -1,17 +1,4 @@
-"""HTTP 入口与认证中间件（``main.py``）。
-
-这一组是纯 ASGI 层的测试：不启服务、不占端口，直接把构造好的 scope 喂进去。
-覆盖的是"启动期一次失败就能让整个服务裸奔"那条链的每一环。
-
-== 被测的三个缺陷 ==
-
-1. **静默降级**。SSE 应用构造失败时旧代码在 ``except`` 里退回
-   ``mcp.http_app(path="/")`` —— Streamable HTTP 挂到了根路径上。
-2. **根路径按路径放行**。旧中间件对 ``path == "/"`` 无条件放行，
-   和上一条叠加就是：一次启动期异常 → 整个工具集可匿名调用。
-3. **认证细节**。畸形 ``Authorization`` 头返回 500（把解析异常当服务端故障），
-   比较用 ``==``，以及 WebSocket scope 掉进 HTTP 专用处理器后 ``KeyError: 'method'``。
-"""
+"""HTTP 入口与认证中间件（``main.py``）。"""
 
 from __future__ import annotations
 
@@ -180,12 +167,7 @@ async def test_bad_credentials_are_rejected_with_challenge(headers):
     b"\xff\xff\xff",
 ])
 async def test_undecodable_header_is_400_not_500(value: bytes):
-    """无法解码的头是客户端的问题（400），不是服务端故障（500）。
-
-    旧代码在解码处直接抛异常 → 500。400 和 401 的区别在这里是实质性的：
-    400 说"你这条请求本身不合法"，401 说"凭据不对，请重发一遍带对凭据的请求"——
-    对一个连字节都不是合法 UTF-8 的头，让客户端重试是没有意义的。
-    """
+    """无法解码的头是客户端的问题（400），不是服务端故障（500）。"""
     downstream = _Downstream()
     app = AuthMiddleware(downstream, TOKEN)
     status, _, _ = await _call_http(app, "POST", "/messages/", [("authorization", value)])
@@ -252,13 +234,7 @@ async def test_token_with_surrounding_whitespace_is_accepted():
     ],
 )
 async def test_duplicate_authorization_headers_fail_closed(headers):
-    """重复的认证头必须拒绝，不能"取第一个/最后一个"。
-
-    代理链上出现重复头时，两端的解读不一致就是经典的绕过手法。旧实现直接
-    ``dict(scope["headers"])``（后者覆盖前者），于是**头顺序决定**是否放行。
-    重复头是歧义请求，回 400（与"畸形头回 400"的既有约定一致），
-    而不是伪装成 401 让人以为只是 token 不对。
-    """
+    """重复的认证头必须拒绝，不能"取第一个/最后一个"。"""
     downstream = _Downstream()
     app = AuthMiddleware(downstream, TOKEN)
     status, _, _ = await _call_http(app, "POST", "/messages/", headers)
@@ -347,11 +323,7 @@ def test_origins_are_parsed_from_env():
 # ==========================================================================
 
 async def test_websocket_without_token_is_closed_not_crashed():
-    """旧代码把 WebSocket scope 交给只认 ``scope["method"]`` 的处理器，
-    结果是 ``KeyError: 'method'`` —— 既是健壮性 bug，也让连接状态不明。
-
-    正确做法是明确握手拒绝（1008 = policy violation）。
-    """
+    """旧代码把 WebSocket scope 交给只认 ``scope["method"]`` 的处理器， 结果是 ``KeyError: 'method'`` —— 既是健壮性 bug，也让连接状态不明。"""
     downstream = _Downstream()
     app = AuthMiddleware(downstream, TOKEN)
     sent = await _call_websocket(app, [])
@@ -499,15 +471,7 @@ def _route_paths(app) -> list[str]:
 
 
 def test_protocol_endpoint_is_not_mounted_at_root():
-    """协议端点必须在自己的路径上，不能挂在根路径。
-
-    直接看**构造出来的路由表**，而不是看调用参数 —— 参数语义会变
-    （实测：对 ``transport="sse"``，``path`` 控制的是 SSE 端点本身，
-    传 ``path="/messages"`` 会让两个路由撞在一起），路由表不会骗人。
-
-    这条同时防的是：有人为了"顺手修一下"把路径改成 ``/``，
-    于是协议端点落回中间件的豁免面之外又被无条件放行。
-    """
+    """协议端点必须在自己的路径上，不能挂在根路径。"""
     paths = _route_paths(main_mod.build_sse_app())
     assert "/" not in paths, f"协议端点不该挂在根路径：{paths}"
     assert "/sse" in paths, f"SSE 端点应当钉在 /sse：{paths}"

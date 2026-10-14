@@ -1,24 +1,4 @@
-"""参数契约：本服务对调用方承诺的参数范围 —— 单一事实来源。
-
-== 这个模块解决什么 ==
-
-上游每个引擎的 ``search()`` 都带 ``**kwargs``，所以**任何拼错的参数名都会被静默吞掉**：
-调用方以为设了 ``cutBorders``，实际发出去的仍是默认值，而且没有任何提示。
-更早的版本还把无效参数写进了对外公示（Yandex 的 ``rpt``/``cbir_page``、TraceMoe 的
-``cutBorders``、SauceNAO 的 ``output_type``），于是"公示了"被当成"支持了"。
-
-本模块的每一项都来自**对已安装 PicImageSearch 的真实签名检查**，不是从 README 或
-旧的 ``ENGINE_INFO`` 手抄。核验方式见 ``tests/test_param_contract.py``：
-它把这里的契约与 ``inspect.signature`` 逐项比对，上游改签名时会先响。
-
-== 三条规矩 ==
-
-1. **白名单之外一律拒绝**，不静默吞掉。
-2. **保留键永远不接受用户输入**（``url``/``file``/``client``/``api_key``/``request_kwargs``）。
-   早期版本在装好 ``file``/``url`` 之后执行 ``search_kwargs.update(extra_params)``，
-   使得 ``file`` 能被覆盖成任意本地路径 —— 那是服务端任意文件读取。
-3. **对外公示由本模块生成**，不做手写副本，避免文档与行为各自漂移。
-"""
+"""各引擎支持的参数、类型和取值范围，以及对应的校验与说明生成函数。"""
 
 from __future__ import annotations
 
@@ -27,10 +7,7 @@ from typing import Any, Mapping
 
 
 class ParamError(ValueError):
-    """调用方参数不合契约。
-
-    带上足够定位的信息：哪个引擎、哪个键、为什么拒、允许什么。
-    """
+    """参数校验错误，包含引擎名和参数名。"""
 
     def __init__(self, message: str, *, engine: str = "", key: str = ""):
         self.engine = engine
@@ -66,11 +43,7 @@ RESERVED_KEYS: frozenset[str] = frozenset({
 
 @dataclass(frozen=True)
 class Spec:
-    """一个参数的类型与取值约束。
-
-    ``type`` 只取 ``bool`` / ``int`` / ``str``。注意 **bool 必须先于 int 判断** ——
-    Python 里 ``isinstance(True, int)`` 为真，反过来会把布尔值放进整数参数。
-    """
+    """单个参数的类型、默认值和取值限制。"""
 
     type: type
     default: Any
@@ -125,11 +98,7 @@ class Spec:
 
 @dataclass(frozen=True)
 class EngineContract:
-    """一个引擎对外的参数面。
-
-    ``init`` 是构造参数（构造 ``Engine(client=..., **init)`` 时传入）；
-    ``search`` 是搜索参数（``Engine.search(**search)`` 时传入）。
-    """
+    """引擎的构造参数、搜索参数与支持状态。"""
 
     init: Mapping[str, Spec] = field(default_factory=dict)
     search: Mapping[str, Spec] = field(default_factory=dict)
@@ -139,27 +108,14 @@ class EngineContract:
 
 
 # --------------------------------------------------------------------------
-# 契约本体
-#
-# 每个条目的 inclusion/exclusion 理由都写在旁边。**排除项也是契约的一部分** ——
-# 否则下一个人会以为漏了。
+# 保留不开放参数的原因，便于后续调整支持范围。
 # --------------------------------------------------------------------------
 
 CONTRACTS: dict[str, EngineContract] = {
-    # Yandex.__init__(base_url, request_kwargs)
-    # Yandex.search(url, file, **kwargs)
-    # 排除 rpt / cbir_page：签名里没有它们；上游在 engines/yandex.py 内写死
-    #   {"rpt": "imageview", "cbir_page": "sites"}，用户传什么都会被覆盖 ——
-    #   旧版把它们公示成"高级参数"，调用方设了不生效。
+    # Yandex 的 rpt / cbir_page 由上游固定，不作为可配置参数。
     "Yandex": EngineContract(),
 
-    # SauceNAO.__init__(base_url, api_key, numres, hide, minsim, output_type,
-    #                   testmode, dbmask, dbmaski, db, dbs, request_kwargs)
-    # 排除 output_type：engines/saucenao.py 把 output_type 放进请求参数，但解析
-    #   永远走 json_loads(resp.text)；设成非 2 会让 SauceNAO 返回 HTML 而解析失败。
-    #   即"这个参数存在，但这个库用不了它"。
-    # 排除 dbs / dbmask / dbmaski：与 db 重叠，面窄，本批不开。
-    # 排除 api_key：凭据走环境变量，不接受调用方传入。
+    # output_type 固定为 JSON；数据库位掩码暂未开放；api_key 从环境读取。
     "SauceNAO": EngineContract(
         init={
             "numres": Spec(int, 5, "返回条数上限", minimum=1, maximum=40),
@@ -179,18 +135,7 @@ CONTRACTS: dict[str, EngineContract] = {
         },
     ),
 
-    # TraceMoe.__init__(base_url, base_url_api, mute, size, request_kwargs)
-    # TraceMoe.search(url, file, key, anilist_id, chinese_title, cut_borders, **kwargs)
-    #
-    # 命名坑：对外 Python 参数名是 **cut_borders**（下划线）。旧版公示的是
-    #   ``cutBorders``，那是 HTTP 查询串里的名字；传进来会被 **kwargs 吞掉，
-    #   出站请求仍是默认的 cutBorders=true。
-    #
-    # 上游缺陷（已实测，不在本服务修复范围）：``chinese_title`` 参数存在且默认为 True，
-    #   engines/tracemoe.py 里会执行 item.title_chinese = anime_info["title"].get("chinese","")，
-    #   但模块级 ANIME_INFO_QUERY 的 GraphQL 只请求 native/romaji/english —
-    #   接口不会返回 chinese，所以该字段恒为空串。**该参数目前是空操作。**
-    # 排除 key：那是 trace.moe 的 API Key，属凭据，走环境变量的路线由使用方决定。
+    # 参数名使用 cut_borders。chinese_title 在当前上游查询中不产生中文标题。
     "TraceMoe": EngineContract(
         search={
             "cut_borders": Spec(bool, True, "裁掉黑边"),
@@ -217,10 +162,7 @@ CONTRACTS: dict[str, EngineContract] = {
         note="上游已将 Google 引擎标记为弃用，后续版本可能移除；建议改用 GoogleLens。",
     ),
 
-    # GoogleLens.__init__(base_url, search_url, search_type, q, hl, country, request_kwargs)
-    # GoogleLens.search(url, file, q, **kwargs)
-    # 排除 search_type / hl / country：取值集合未逐个核验，不放进白名单 ——
-    #   "没核验过的取值"不该对外承诺。
+    # 只开放查询词 q；其他参数的取值范围尚未验证。
     "GoogleLens": EngineContract(
         init={
             "q": Spec(str, "", "附加查询词"),
@@ -241,7 +183,7 @@ CONTRACTS: dict[str, EngineContract] = {
     ),
 
     # Iqdb.__init__(is_3d, request_kwargs)
-    # Iqdb.search(url, file, force_gray, **kwargs)
+    # Iqdb.search(url, file, force_gray, kwargs)
     "Iqdb": EngineContract(
         init={
             "is_3d": Spec(bool, False, "搜索 3D 站点"),
@@ -251,9 +193,7 @@ CONTRACTS: dict[str, EngineContract] = {
         },
     ),
 
-    # Tineye.__init__(base_url, request_kwargs)
-    # Tineye.search(url, file, show_unavailable_domains, domain, sort, order, tags, **kwargs)
-    # 只开 show_unavailable_domains：sort/order/tags 的取值集合未核验。
+    # 只开放 show_unavailable_domains；排序与标签参数暂未验证。
     "Tineye": EngineContract(
         search={
             "show_unavailable_domains": Spec(bool, False, "包含当前不可用的站点"),
@@ -281,14 +221,9 @@ def validate_extra_params(
     engine: str,
     raw: Any,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """把调用方给的 extra params 按契约拆成 (init_kwargs, search_kwargs)。
+    """校验附加参数，并拆分为 (init_kwargs, search_kwargs)。
 
-    任何不合契约的输入都抛 :class:`ParamError`，**绝不静默忽略**。这一点是刻意的：
-    上游每个 ``search()`` 都有 ``**kwargs``，静默吞掉是它的默认行为，靠它就等于没有契约。
-
-    顶层必须是对象（JSON object）。数组、null、标量都拒绝 —— 早期版本直接
-    ``search_kwargs.update(extra_params)``，顶层类型不对时会以各种方式穿透到下游。
-    """
+    None 表示未提供参数；其余输入必须是对象，未知键和保留键均被拒绝。"""
     if raw is None:
         return {}, {}
 
@@ -338,17 +273,17 @@ def validate_extra_params(
 # --------------------------------------------------------------------------
 
 _BRIEFS: dict[str, str] = {
-    "Yandex": "综合能力最强的通用搜图引擎，对裁剪、翻转和修改过的图片识别率极高。",
-    "SauceNAO": "专注二次元插画、漫画和动漫截图搜索。Pixiv 图片识别率极高。需要 API Key。",
-    "Ascii2D": "专注二次元插画，特别适合查找 Twitter 和 Pixiv 上的原始画师。支持颜色搜索和特征搜索。",
+    "Yandex": "通用图片来源与相似图片搜索。",
+    "SauceNAO": "插画、漫画与动漫图片来源查询，可配置 SauceNAO API Key。",
+    "Ascii2D": "插画来源查询，支持颜色搜索和特征搜索。",
     "TraceMoe": "动漫截图专用搜索引擎，可识别具体番剧名称、集数和时间点。",
     "EHentai": "专门搜索 E-Hentai 和 ExHentai 的图库。搜索 ExHentai 需要在环境中配置该引擎的 cookies。",
     "Google": "谷歌通用搜图。适合寻找类似图片或图片来源。",
-    "GoogleLens": "谷歌智慧镜头。擅长识别物体、文字和商品。",
-    "BaiDu": "百度识图，国内资源识别较好。",
+    "GoogleLens": "Google Lens 图片搜索。",
+    "BaiDu": "百度识图。",
     "Bing": "必应视觉搜索。",
     "Iqdb": "多站聚合搜索 (Danbooru, Konachan, etc.)，适合二次元图片。",
-    "Tineye": "老牌反向搜图引擎，擅长寻找精确匹配的图片来源。",
+    "Tineye": "图片来源与重复图片搜索。",
 }
 
 _STATUS_LABEL = {
@@ -361,14 +296,14 @@ _STATUS_LABEL = {
 def engine_brief(engine: str) -> str:
     contract = CONTRACTS[engine]
     label = _STATUS_LABEL.get(contract.status, "")
-    text = f"{label}{_BRIEFS.get(engine, engine)}支持情况：[URL: 是, 文件: 是]。"
+    text = f"{label}{_BRIEFS.get(engine, engine)}输入：图片 URL 或 Base64。"
     if contract.note:
         text += contract.note
     return text
 
 
 def engine_details(engine: str) -> str:
-    """单个引擎的详情文本。参数清单由契约生成，手写副本必然漂移。"""
+    """根据参数定义生成单个引擎的说明。"""
     contract = CONTRACTS[engine]
     lines = [f"=== {engine} ===", f"Brief: {engine_brief(engine)}"]
 

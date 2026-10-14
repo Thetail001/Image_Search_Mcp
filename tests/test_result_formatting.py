@@ -1,18 +1,4 @@
-"""结果格式化：零值、被丢掉的字段、以及不该重复的字段。
-
-这里用**上游真实的模型对象**，不是自造的属性对象 ——
-自造对象只能证明"格式化器认得上游字段"，证明不了"上游真的产出了那个字段"。
-
-修掉的三类问题：
-
-1. **零值被当成"没有值"**。``if item.episode`` 对 0 为假 —— 集数 0 直接消失；
-   ``end_time if end_time else '?'`` 把 ``To=0`` 显示成问号。判断有无值要用 ``is not None``。
-2. **同类信息在不同引擎下时有时无**。``similarity`` 只在 Iqdb 分支被读，
-   而 SauceNAO 项明明也带这个字段；``author_url`` 同理。
-   现在 ``similarity`` 不再按引擎分叉。
-3. **没被读到的字段**。SauceNAO 项里还有 ``ext_urls`` 之外的信息（如 ``hidden``、
-   ``index_name``），以及 TraceMoe 的 ``video`` / ``image`` —— 旧代码丢着没输出。
-"""
+"""结果格式化：零值、被丢掉的字段、以及不该重复的字段。"""
 
 from __future__ import annotations
 

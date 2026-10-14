@@ -1,15 +1,4 @@
-"""从代码和产物生成实施状态，供文档引用。
-
-存在理由：手写的"当前进度"必腐烂。实测过一次 —— 工程 README 写着
-「汉化 v1.5 / 流水线九步 / 校验 11 项」，而实际早已是 V4.1 / 43 步。
-入口文档过期比没有入口文档更糟：它会让人按错的东西去排查。
-
-所以文档里凡是能从这里取到的，就不许手抄。
-
-用法：
-    python tools/status.py            # 人读
-    python tools/status.py --markdown # 直接贴进文档
-"""
+"""生成引擎、测试与故障注入统计，可更新文档中的统计区块。"""
 
 from __future__ import annotations
 
@@ -134,7 +123,6 @@ def build() -> dict[str, object]:
 
 
 def render_markdown(data: dict[str, object]) -> str:
-    repo = data["repo"]  # type: ignore[assignment]
     engines = data["engines"]  # type: ignore[assignment]
     tests = data["tests"]  # type: ignore[assignment]
     total_tests = sum(tests.values())
@@ -143,9 +131,6 @@ def render_markdown(data: dict[str, object]) -> str:
         "<!-- 本段由 tools/status.py 生成，勿手改。重新生成：",
         "     python tools/status.py --update docs/实施进度.md -->",
         "",
-        f"- 分支：`{repo['branch']}`　基线：`origin/main@{repo['base']}`"
-        f"（{repo['base_subject']}）",
-        f"- 相对基线的改动：{repo['dirty_count']} 个未提交文件",
         f"- 引擎：{engines['engines']} 个，参数契约覆盖 {engines['contracts']} 个",
         f"- 测试：**{total_tests}** 条",
         f"- 反向测试注入：**{data['injections']}** 条",
@@ -156,14 +141,6 @@ def render_markdown(data: dict[str, object]) -> str:
     for path, count in tests.items():
         lines.append(f"- `{path}` — {count}")
 
-    lines += ["", "### 新增源码规模", ""]
-    for path, count in data["new_source_lines"].items():  # type: ignore[union-attr]
-        lines.append(f"- `{path}` — {count} 行")
-
-    lines += ["", "### 新增/改动测试规模", ""]
-    for path, count in data["new_test_lines"].items():  # type: ignore[union-attr]
-        lines.append(f"- `{path}` — {count} 行")
-
     return "\n".join(lines)
 
 
@@ -172,12 +149,7 @@ MARKER_END = "---"
 
 
 def update_file(path: Path) -> int:
-    """把生成的状态段写回文档里，替换两个标记之间的内容。
-
-    手抄数字必腐烂 —— 实测过一次：工程 README 写着「汉化 v1.5 / 流水线九步」，
-    而实际早已是 V4.1 / 43 步。所以这里连"把生成结果粘贴进文档"这一步
-    也交给脚本做，人不要经手。
-    """
+    """替换文档中起止标记之间的统计区块。"""
     if not path.is_file():
         print(f"找不到文件：{path}", file=sys.stderr)
         return 2

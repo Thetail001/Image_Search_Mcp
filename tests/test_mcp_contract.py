@@ -1,11 +1,4 @@
-"""MCP 协议层的契约：工具声明与结果形状。
-
-为什么单独一个文件：这里断言的不是"业务对不对"，而是**协议上对外承诺了什么** ——
-工具标题与注解、输出 schema、以及失败到底是 ``isError`` 还是"一条看起来正常的结果"。
-
-全部走真实的 ``fastmcp.Client``（in-memory transport），不手搓 ``CallToolResult``：
-只有走真实那条路，才测得到 fastmcp 究竟把我们的返回值变成了什么。
-"""
+"""MCP 协议层的契约：工具声明与结果形状。"""
 
 from __future__ import annotations
 
@@ -190,11 +183,7 @@ async def test_successful_search_returns_structured_content_and_keeps_the_text(t
     ({"source": SOURCE, "engine": "TraceMoe", "extra_params_json": "{not json"}, "不是合法 JSON"),
 ])
 async def test_input_rejections_come_back_as_is_error(trace_moe, arguments: dict, expected: str):
-    """输入类失败必须是 ``isError: true``。
-
-    旧写法把它当**正常结果**返回（一条以 ``Error: `` 开头的文本），客户端和模型
-    无法与真正的结果区分 —— 复核报告 A 点过这条。
-    """
+    """输入类失败必须是 ``isError: true``。"""
     async with Client(server.mcp) as client:
         result = await client.call_tool_mcp("search_image", arguments)
 
@@ -202,12 +191,20 @@ async def test_input_rejections_come_back_as_is_error(trace_moe, arguments: dict
     assert expected in _text_of(result)
 
 
-async def test_error_text_does_not_gain_a_tool_name_prefix(trace_moe):
-    """用 ``ToolError`` 而不是让裸异常冒出去。
+@pytest.mark.parametrize("limit", [True, 1.0, "1"])
+async def test_mcp_rejects_non_integer_limits_before_search(trace_moe, limit):
+    seen, _ = trace_moe
+    async with Client(server.mcp) as client:
+        result = await client.call_tool_mcp(
+            "search_image", {"source": SOURCE, "engine": "TraceMoe", "limit": limit}
+        )
 
-    例外：裸异常的消息会被 fastmcp 加上 ``Error calling tool 'x': `` 前缀（实测），
-    那对模型只是噪音，也让报错文本不再是我们写的那句。
-    """
+    assert result.is_error is True
+    assert not seen
+
+
+async def test_error_text_does_not_gain_a_tool_name_prefix(trace_moe):
+    """用 ``ToolError`` 而不是让裸异常冒出去。"""
     async with Client(server.mcp) as client:
         result = await client.call_tool_mcp(
             "search_image", {"source": SOURCE, "engine": "NotAnEngine"}
@@ -272,19 +269,7 @@ async def test_unknown_engine_in_engine_info_is_a_tool_error():
 
 
 async def test_unknown_tool_is_reported_by_the_framework_as_is_error():
-    """**已知偏差，记录在案**。
-
-    规范把"未知工具"归为**协议错误**（JSON-RPC error，如 -32602），
-    但 fastmcp 4.0.10 把它变成了 ``isError: true`` 的工具执行错误（实测，
-    消息为 ``Unknown tool: 'x'``）。
-
-    这里断言**实测行为**而不是规范行为：写一条按规范断言、而我们并不实现的测试，
-    只会得到一条永远在撒谎的测试。偏差记在这里 —— 哪天 fastmcp 改了，这条会红，
-    那时再决定要不要跟着改。
-
-    实用影响很小：消息本身可操作，模型照样能自我修正。
-    （``client.call_tool`` 那条路上它会抛 ``ToolError``，是同一个事实的另一种表现。）
-    """
+    """已知偏差，记录在案。"""
     async with Client(server.mcp) as client:
         result = await client.call_tool_mcp("definitely_not_a_tool", {})
 

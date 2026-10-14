@@ -1,15 +1,4 @@
-"""README 里的示例必须真的能通过参数契约。
-
-为什么要这道门禁：文档里的参数名腐烂是**无声**的。旧 README 一直写着
-``{"cutBorders": false}``，它从来没生效过（落进上游的 ``**kwargs`` 被静静吞掉），
-而没有任何东西会因此变红 —— 读者照着抄，得到的是"设置了但没反应"。
-
-所以这里把 README 里所有 ``json`` 代码块抽出来，凡是长得像 ``search_image``
-调用的，都拿真实的校验函数跑一遍。文档写错参数名，CI 就红。
-
-配套的反向测试会往 README 里注入一个驼峰参数名，要求本文件的测试变红 ——
-见 ``tools/reverse_tests/bugs.py`` 的 ``readme-bad-param-name``。
-"""
+"""README 里的示例应能能通过参数契约。"""
 
 from __future__ import annotations
 
@@ -103,11 +92,7 @@ def test_readme_examples_have_valid_limit():
 
 
 def test_readme_does_not_document_the_global_cookie_variable():
-    """全局 ``IMAGE_SEARCH_COOKIES`` 已经不被接受，文档不该再教它。
-
-    允许在说明文字里提到它（"不再被接受"那段就是），但不许出现在
-    配置示例的行内赋值里 —— 那种写法会被直接抄走。
-    """
+    """新配置示例使用引擎专属变量；旧配置的兼容说明可保留在正文中。"""
     text = README.read_text(encoding="utf-8")
     offenders = [
         line for line in text.splitlines()

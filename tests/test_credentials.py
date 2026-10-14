@@ -1,15 +1,4 @@
-"""凭据归属与出站范围。
-
-核心断言只有一句：**引擎的 cookie 只能发给该引擎真正访问的域名。**
-
-围绕它有三组容易漏掉的反向检查：
-
-- 用**真实的 ``Network``** 而不是 Mock 来验（把构造换成宽松 Mock，
-  就永远发现不了"应用层把入参类型重塑了"这件事 —— 那正是旧代码的 bug）
-- 不仅验"传字符串"，还验"字符串 + 无域 cookie"这条更隐蔽的形态
-  （只还原 dict 实现的话，类型测试会红，但泄露不会）
-- 正向也要有：正确引擎必须真的收到凭据 —— 否则"把 cookie 功能整个删掉"也能通过
-"""
+"""凭据归属与出站范围。"""
 
 from __future__ import annotations
 
@@ -77,11 +66,7 @@ def test_ehentai_lists_both_sites():
 # ==========================================================================
 
 def test_cookie_string_is_normalized_to_a_string():
-    """上游 Network 对 cookies 调 .split(";") —— 必须给字符串。
-
-    旧代码返回 dict，于是任何**非空**配置都必然抛
-    ``AttributeError: 'dict' object has no attribute 'split'``。
-    """
+    """上游 Network 对 cookies 调 .split(";") —— 必须给字符串。"""
     result = normalize_cookie_string("sid=abc;  other=1 ", engine="Yandex")
     assert isinstance(result, str)
     assert result == "sid=abc; other=1"
@@ -108,11 +93,7 @@ def test_bad_cookie_strings_are_rejected_with_actionable_message(bad: str, keywo
     "a=1; b=2",
 ])
 def test_cookie_values_may_contain_equals(good: str):
-    """含 ``=`` 的值必须接受，且**原样保留**（不只是"没抛异常"）。
-
-    旧校验是 ``^[^=;]+=[^=;]*$``，把值里的 ``=`` 一并禁掉 ——
-    base64 编码的凭据（``sid=YWJjZA==``）配上就被误拒，而 base64 是最常见的形态。
-    """
+    """含 ``=`` 的值必须接受，且原样保留（不只是"没抛异常"）。"""
     result = normalize_cookie_string(good, engine="Yandex")
     for segment in (s.strip() for s in good.split(";")):
         if segment:
@@ -216,12 +197,7 @@ def test_bad_proxy_is_rejected(bad: str):
 
 
 def test_proxy_error_does_not_echo_the_secret():
-    """错误信息不得回显代理解析原文 —— 它会经 server 的错误出口给调用方。
-
-    ``http://user:pass@`` 的原文里就写着密码。cookie 那条同类路径当时已经脱敏，
-    代理这条漏了（复核报告：错误代理 URL 回显 secret）。这里连用户名也不回显：
-    保留"哪一类问题"的信息就够定位，具体值没有理由外传。
-    """
+    """错误信息不得回显代理解析原文 —— 它会经 server 的错误出口给调用方。"""
     secret = "SYNTHETIC_PROXY_SECRET"
     with pytest.raises(CredentialError) as exc:
         load_proxy({"IMAGE_SEARCH_PROXY": f"http://user:{secret}@"})
@@ -243,22 +219,14 @@ def test_proxy_error_does_not_echo_the_secret():
     ],
 )
 def test_proxy_shape_errors_are_config_errors_not_internal_errors(bad: str):
-    """坏形状要当场归成配置错。
-
-    旧实现不查端口，非法端口一路漏到 httpx 才炸，被兜底成"内部错误（...）"——
-    那等于把纯配置问题说成我们的 bug，调用方拿到的是无从下手的类型名。
-    """
+    """坏形状要当场归成配置错。"""
     with pytest.raises(CredentialError) as exc:
         load_proxy({"IMAGE_SEARCH_PROXY": bad})
     assert exc.value.hint, "配置错要给可操作的提示"
 
 
 def test_valid_proxy_with_credentials_still_works():
-    """正例：脱敏只作用于错误信息，不能顺手把能用的代理弄坏。
-
-    ``load_proxy`` 必须原样交出 URL —— 带凭据的代理本来就是支持的用法，
-    下游要用它建连接。
-    """
+    """正例：脱敏只作用于错误信息，不能顺手把能用的代理弄坏。"""
     raw = "http://user:pw@127.0.0.1:7890"
     proxy = load_proxy({"IMAGE_SEARCH_PROXY": raw})
     assert proxy is not None
@@ -267,11 +235,7 @@ def test_valid_proxy_with_credentials_still_works():
 
 
 def test_generic_proxy_env_vars_are_not_used():
-    """HTTP_PROXY / HTTPS_PROXY 不再被隐式采用。
-
-    旧代码会退回读它们：用户没配过代理，带凭据的请求却悄悄走了环境里的代理；
-    而且那条路径本身是坏的（给只吃字符串的参数传 dict，必然抛异常）。
-    """
+    """HTTP_PROXY / HTTPS_PROXY 不再被隐式采用。"""
     assert load_proxy({"HTTP_PROXY": "http://192.0.2.1:3128"}) is None
     assert load_proxy({"HTTPS_PROXY": "http://192.0.2.1:3128"}) is None
     assert credentials.ignored_proxy_vars(
@@ -301,11 +265,7 @@ def recorder(mock_http):
 
 
 async def test_scoped_jar_only_sends_to_the_engine_domain(recorder):
-    """用**真实的 Network** 验：域限定的 jar 只发给该引擎的域。
-
-    刻意不 Mock Network —— 旧 bug 正是"应用层把入参类型重塑了"，
-    用宽松 Mock 会把它遮住。
-    """
+    """用真实的 Network 验：域限定的 jar 只发给该引擎的域。"""
     jar = build_cookie_jar("sid=ENGINE_SECRET", domains=cookie_domains_for("Yandex"))
 
     async with Network() as net:          # 真实 Network，非 Mock
@@ -330,11 +290,7 @@ async def test_domain_scoping_also_covers_subdomains(recorder):
 
 
 async def test_unscoped_cookie_string_leaks_to_every_domain(recorder):
-    """反向证据：**无域** cookie 会发给任何域名。
-
-    这条是"为什么必须用 Cookies().set(domain=...)"的现场证据 ——
-    同时也说明"每次新建一个 client"并不提供隔离（cookie 本身没域，换 client 照样跟着走）。
-    """
+    """反向证据：无域 cookie 会发给任何域名。"""
     async with Network(cookies="sid=LEAK") as net:
         await net.get("https://yandex.com/a")
         await net.get("https://untrusted.invalid/b")
@@ -380,12 +336,7 @@ HOSTS_THAT_NEED_NO_CREDENTIALS = {
 
 @pytest.mark.parametrize("engine", sorted(COOKIE_DOMAINS))
 def test_every_upstream_host_is_declared_or_explicitly_excused(engine: str) -> None:
-    """源码里出现的每个主机都必须有归属。
-
-    只验"表里的域在源码里存在"是**单向**的：那样从表里**删掉**一个域
-    （比如 Google 的 google.co.jp）测试照样通过，而那批凭据就再也发不出去了
-    —— 功能坏了却没人知道（复核报告 B6）。这里把方向反过来。
-    """
+    """源码里出现的每个主机都必须有归属。"""
     source = inspect.getsource(
         __import__(f"PicImageSearch.engines.{ENGINE_MODULES[engine]}", fromlist=["_"])
     )
@@ -411,11 +362,7 @@ def test_every_upstream_host_is_declared_or_explicitly_excused(engine: str) -> N
 # ==========================================================================
 
 def test_cookie_jar_only_sends_over_https() -> None:
-    """凭据不能跟着明文 ``http://`` 走。
-
-    ``Cookies.set()`` 内部造出的 ``Cookie`` 是 ``secure=False``，于是
-    ``http://yandex.com/`` 这个明文地址也会带上 cookie（复核报告 B4，已实测）。
-    """
+    """凭据不能跟着明文 ``http://`` 走。"""
     jar = build_cookie_jar("sid=SECRET", domains=("yandex.com",))
 
     over_http = httpx.Request("GET", "http://yandex.com/a", cookies=jar)
@@ -434,11 +381,7 @@ def test_cookie_jar_entries_are_marked_secure() -> None:
 
 
 def test_default_cookie_object_is_not_secure_which_is_why_we_build_our_own() -> None:
-    """反向证据：``Cookies.set()`` 的默认行为就是会跟着 ``http://`` 走。
-
-    这条是"为什么不用 ``Cookies.set()``"的现场证据 —— 它也说明
-    "把地址校验做成 https-only"这件事光靠调用方自觉是不够的。
-    """
+    """反向证据：``Cookies.set()`` 的默认行为就是会跟着 ``http://`` 走。"""
     default = httpx.Cookies()
     default.set("sid", "X", domain="yandex.com")
 
@@ -457,13 +400,7 @@ def _proxy_mounts(client: httpx.AsyncClient) -> set[str]:
 
 
 async def test_inherited_env_proxy_mounts_are_removed(monkeypatch, real_client_init) -> None:
-    """必须用**真实 client** 来验。
-
-    默认夹具会给 client 注入 transport，而 httpx 一旦拿到 transport 就**不读**环境代理
-    （``allow_env_proxies = trust_env and transport is None``），所以那种写法
-    把实现改回 ``trust_env=True`` 也照样通过 —— 就是复核报告 B6 说的假测试。
-    这里用 ``real_client_init`` 拿到真实构造路径。
-    """
+    """必须用真实 client 来验。"""
     monkeypatch.setenv("HTTPS_PROXY", "http://192.0.2.1:3128")
 
     async with httpx.AsyncClient() as client:

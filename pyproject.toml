@@ -24,12 +24,13 @@ classifiers = [
     "Topic :: Multimedia :: Graphics",
 ]
 dependencies = [
-    # 故意**不**给上界：PicImageSearch 的 main 分支已经走到 httpx→httpx2
-    # 这种破坏性迁移，而 PyPI 上的 3.12.11 就是我们在用的版本。
-    # 上界解决不了"上游改了行为"这件事，只会让人以为锁住了。
-    # 真正的保护是 tests/ 里那套对着真实签名的契约测试 + CI 里跑一遍。
-    "fastmcp>=4.0",
-    "PicImageSearch>=3.12",
+    "fastmcp>=4.0,<5",
+    # 参数签名和 httpx client 集成以 3.12.11 为基线。
+    "PicImageSearch>=3.12.11,<3.13",
+    "httpx>=0.28,<0.29",
+    "mcp>=2.3,<3",
+    "pydantic>=2,<3",
+    "starlette>=0.40,<2",
     "uvicorn>=0.30",
 ]
 
@@ -37,11 +38,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
-    # 测试里必须有超时：一个每 50ms 吐 1 字节的响应能把测试永远挂住
-    # （实测踩过），CI 上表现为"卡住"而不是"失败"，比失败更难查。
+    # 限制单个测试的执行时间。
     "pytest-timeout>=2.3",
-    # 用来真的按 outputSchema 校验结构化输出。声明成显式依赖而不是白拿
-    # 传递依赖：不然哪天上游不再依赖它，测试会以一种很难懂的方式挂掉。
+    # 校验 MCP 结构化输出。
     "jsonschema>=4.0",
 ]
 
@@ -58,8 +57,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-# 收集时先拒网：conftest 会给 httpx 注入"拒绝一切"的 transport，
-# 任何未经 mock 的出站请求都会立刻失败而不是真的打出去。
+# tests/conftest.py 默认拦截未经 mock 的 HTTP 与 DNS 请求。
 addopts = "-ra --strict-markers"
 filterwarnings = [
     "error::DeprecationWarning:PicImageSearch.*",

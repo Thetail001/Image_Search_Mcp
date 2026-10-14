@@ -1,9 +1,4 @@
-"""安全下载器的行为与边界。
-
-这些测试**不联网**：解析器是注入的，连接层是注入的。
-正例也在这里 —— "所有下载都被拒绝"同样能通过一组纯负向测试，
-所以每条拒绝旁边都要有能走通的正例。
-"""
+"""安全下载器的行为与边界。"""
 
 from __future__ import annotations
 
@@ -80,16 +75,7 @@ class _BurstStream(httpx.AsyncByteStream):
 
 
 async def test_read_bounded_checks_the_deadline_itself():
-    """内层必须自己查期限 —— 外层 ``wait_for`` 不总能先到。
-
-    复核报告实测：20 ms 期限配一个忙转的流，实际跑到 135 ms（取消只能投递到
-    await 点）。所以这条**绕过外层**直接调 ``_read_bounded``，并且给一个
-    **已经过期**的期限：只有内层的检查能把这次读变成 timeout。
-    把内层那段删掉，这条就会红 —— 这正是它作为门禁的意义。
-
-    只留内层同样不行（卡在裸 await 上时轮不到它），那一半由
-    ``test_resolver_that_never_returns_hits_the_deadline`` 守着。
-    """
+    """内层必须自己查期限 —— 外层 ``wait_for`` 不总能先到。"""
     downloader = _downloader(_Recorder(), {"a.example.com": ["93.184.216.34"]})
     target = parse_target("https://a.example.com/img.png", downloader.policy)
     response = httpx.Response(200, stream=_BurstStream())
@@ -472,19 +458,7 @@ async def test_http_error_status_is_reported():
 
 
 async def test_slow_trickle_is_stopped_by_total_deadline():
-    """大小合法、总也发不完的响应 —— 只有总期限能终止它。
-
-    两个刻意的设计：
-
-    - 响应体是**有限**的（80 块 × 30ms ≈ 2.4s）。总期限检查失效时，这个下载会
-      正常结束、不抛异常，测试以一条干净的断言失败收场。写成 ``while True``
-      也能"发现问题"，但那是以挂住 30 秒、抛一屏超时堆栈的方式发现的 ——
-      CI 上表现为"卡住"，比失败难查得多。
-    - 只接受 :class:`DownloadError`，且断言 ``reason == "timeout"``。
-      旧版本收的是 ``(DownloadError, httpx.HTTPError, TimeoutError)`` 这样一个
-      宽泛元组 —— 那等于"只要因为任何原因失败就算通过"，把这条测试变成了
-      "下载器没成功"的同义反复。
-    """
+    """大小合法、总也发不完的响应 —— 只有总期限能终止它。"""
     chunks, delay = 80, 0.03
 
     def _handler(request):
@@ -627,14 +601,7 @@ async def test_resolve_and_validate_accepts_literal_addresses():
 # ==========================================================================
 
 async def test_resolver_that_never_returns_hits_the_deadline():
-    """resolver 卡住时，下载器必须**自己**报 timeout —— 不能一直挂着。
-
-    期限原来只在"每跳开始"和"收到 body chunk"处比较，那两个检查点都在裸 await
-    **之外**：resolver 只要不返回，两个点都到不了，协程就永远停在那儿。
-    实测：探针只能靠外层 ``wait_for`` 停住，下载器自己从不报错。
-
-    去掉 ``fetch`` 里的 ``wait_for``，这条会一直挂到 pytest 的 30s 超时 —— 变红。
-    """
+    """resolver 卡住时，下载器必须自己报 timeout —— 不能一直挂着。"""
 
     async def _never(host: str, port: int) -> list[str]:
         await asyncio.Event().wait()  # 永不返回
@@ -667,16 +634,7 @@ def _gzip_of_repeated_bytes(total: int) -> bytes:
 
 
 async def test_compressed_response_is_refused_before_it_is_decompressed():
-    """带 ``Content-Encoding`` 的响应必须在**读取之前**拒绝。
-
-    为什么不能只靠"读的时候数字节"：httpx 是先 decode 再 yield
-    （``_models.py`` 先 ``decoder.decode(raw)``，``_decoders.py`` 的 gzip
-    解压没有输出长度上限）。实测：32 MiB 压成 32 KB、预算 1 MiB，
-    最终确实报 ``too_large``，但**此前 Python 分配峰值已到 77.41 MiB**。
-
-    所以断言的是**拒绝的理由**，而不是"最终拒绝了"——
-    只有前者能证明解压根本没发生。
-    """
+    """带 ``Content-Encoding`` 的响应必须在读取之前拒绝。"""
     payload = _gzip_of_repeated_bytes(32 * 1024 * 1024)
 
     def handler(request: httpx.Request) -> httpx.Response:

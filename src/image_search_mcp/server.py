@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import binascii
 import json
 import logging
@@ -74,6 +75,12 @@ ENGINES: dict[str, type] = {
 LIMIT_MIN = 1
 LIMIT_MAX = 50
 DEFAULT_LIMIT = 5
+DEFAULT_ENGINE = "Yandex"
+DEFAULT_ENGINE_ENV = "IMAGE_SEARCH_DEFAULT_ENGINE"
+ALL_ENGINE = "All"
+SEARCH_TOTAL_TIMEOUT = 60.0
+ALL_ENGINE_TIMEOUT = 20.0
+ALL_CONCURRENCY = 3
 
 #: 输入图片解码后的上限（Base64 长度按 4/3 反推，留一点余量）
 MAX_IMAGE_BYTES = 16 * 1024 * 1024
@@ -122,6 +129,32 @@ SEARCH_OUTPUT_SCHEMA: dict[str, Any] = {
     },
     "required": ["engine", "result_count", "returned", "truncated", "results"],
 }
+
+# All 沿用通用字段，并增加各引擎状态；单引擎结果的形状保持不变。
+RESULT_ITEM_SCHEMA = SEARCH_OUTPUT_SCHEMA["properties"]["results"]["items"]
+RESULT_ITEM_SCHEMA["properties"]["engine"] = {"type": "string"}
+SEARCH_OUTPUT_SCHEMA["properties"]["all_failed"] = {"type": "boolean"}
+SEARCH_OUTPUT_SCHEMA["properties"]["engine_outcomes"] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "engine": {"type": "string"},
+            "status": {"enum": ["success", "no_results", "error"]},
+            "error": {"type": ["string", "null"]},
+            "result_count": {"type": "integer"},
+            "returned": {"type": "integer"},
+            "truncated": {"type": "boolean"},
+            "results": {"type": "array", "items": RESULT_ITEM_SCHEMA},
+        },
+        "required": ["engine", "status", "error", "result_count", "returned", "truncated", "results"],
+        "additionalProperties": False,
+    },
+}
+SEARCH_OUTPUT_SCHEMA["allOf"] = [{
+    "if": {"properties": {"engine": {"const": ALL_ENGINE}}, "required": ["engine"]},
+    "then": {"required": ["all_failed", "engine_outcomes"]},
+}]
 
 #: 搜索是只读且会访问外部服务；不声明这两点，客户端只能一律当危险操作处理。
 SEARCH_ANNOTATIONS = ToolAnnotations(
@@ -187,6 +220,7 @@ def get_engine_info(engine_name: str = "all") -> str:
     """
     if engine_name.lower() == "all":
         lines = ["Supported Search Engines:"]
+        lines.append("- All: 查询全部引擎；limit 按每个引擎计算，单个引擎失败不影响其他结果。")
         for name in params.CONTRACTS:
             lines.append(f"- {name}: {params.engine_brief(name)}")
         return "\n".join(lines)
@@ -398,13 +432,23 @@ async def _prepare_search_input(
 
 async def _search_image_logic(
     source: str,
-    engine: str = "Yandex",
+    engine: Optional[str] = None,
     extra_params_json: Optional[str] = None,
     limit: int = DEFAULT_LIMIT,
+    *,
+    _prepared_input: dict[str, Any] | None = None,
 ) -> SearchOutcome:
     """执行搜索，将输入、配置和上游异常整理成 SearchOutcome。"""
     try:
-        return await _run_search(source, engine, extra_params_json, limit)
+        resolved_engine = _resolve_engine(engine)
+        if resolved_engine == ALL_ENGINE:
+            return await _run_all_search(source, extra_params_json, limit)
+        return await asyncio.wait_for(
+            _run_search(source, resolved_engine, extra_params_json, limit, prepared_input=_prepared_input),
+            SEARCH_TOTAL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return SearchOutcome(text="Error: 搜索总期限已到", is_error=True)
     except SearchInputError as exc:
         return SearchOutcome(text=f"Error: {exc}", is_error=True)
     except params.ParamError as exc:
@@ -430,11 +474,112 @@ async def _search_image_logic(
         )
 
 
+def _resolve_engine(engine: Optional[str]) -> str:
+    if engine is None:
+        requested = (os.environ.get(DEFAULT_ENGINE_ENV) or DEFAULT_ENGINE).strip() or DEFAULT_ENGINE
+    elif isinstance(engine, str):
+        requested = engine.strip()
+    else:
+        raise SearchInputError("engine 需要字符串或 null")
+    if requested.casefold() == ALL_ENGINE.casefold():
+        return ALL_ENGINE
+    for name in ENGINES:
+        if name.casefold() == requested.casefold():
+            return name
+    raise SearchInputError(f"不支持的引擎 '{requested}'。用 get_engine_info('all') 查看可用列表。")
+
+
+def _all_extra_params(raw: Any) -> dict[str, dict[str, Any]]:
+    """按参数契约分发 All 的参数，先完成整组校验再发出请求。"""
+    if not isinstance(raw, dict):
+        raise SearchInputError("extra_params_json 顶层必须是对象")
+    grouped: dict[str, dict[str, Any]] = {name: {} for name in ENGINES}
+    for key, value in raw.items():
+        if key in params.RESERVED_KEYS:
+            raise SearchInputError(f"'{key}' 是保留参数，不接受调用方传入")
+        recipients = [name for name in ENGINES
+                      if key in params.CONTRACTS[name].init or key in params.CONTRACTS[name].search]
+        if not recipients:
+            raise SearchInputError(f"All 不认识参数 '{key}'")
+        for name in recipients:
+            params.validate_extra_params(name, {key: value})
+            grouped[name][key] = value
+    return grouped
+
+
+async def _run_all_search(source: str, raw_extra: Optional[str], limit: Any) -> SearchOutcome:
+    resolved_limit = _resolve_limit(limit)
+    grouped = _all_extra_params(_load_extra_params(raw_extra))
+    if not isinstance(source, str):
+        raise SearchInputError("source 需要字符串")
+    trimmed = source.strip()
+    prepared = None if trimmed.lower().startswith(("http://", "https://")) else {
+        "file": _decode_image_source(trimmed)
+    }
+    semaphore = asyncio.Semaphore(ALL_CONCURRENCY)
+
+    async def run_one(name: str) -> SearchOutcome:
+        async with semaphore:
+            try:
+                return await asyncio.wait_for(
+                    _search_image_logic(trimmed, name, json.dumps(grouped[name]), resolved_limit,
+                                        _prepared_input=prepared),
+                    ALL_ENGINE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                return SearchOutcome(text=f"Error: {name} 搜索超时", is_error=True)
+
+    tasks = {name: asyncio.create_task(run_one(name)) for name in ENGINES}
+    try:
+        _, pending = await asyncio.wait(tasks.values(), timeout=SEARCH_TOTAL_TIMEOUT)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+        outcomes = [
+            (name, SearchOutcome(text=f"Error: {name} 搜索总期限已到", is_error=True)
+             if task.cancelled() else task.result())
+            for name, task in tasks.items()
+        ]
+    finally:
+        for task in tasks.values():
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    records = []
+    results = []
+    for name, outcome in outcomes:
+        data = outcome.structured or _structured_results(name, [], resolved_limit)
+        status = "error" if outcome.is_error else ("success" if data["result_count"] else "no_results")
+        records.append({**data, "status": status, "error": outcome.text if outcome.is_error else None})
+        results.extend({**item, "engine": name} for item in data["results"])
+    all_failed = all(outcome.is_error for _, outcome in outcomes)
+    structured = {
+        "engine": ALL_ENGINE,
+        "result_count": sum(record["result_count"] for record in records),
+        "returned": len(results),
+        "truncated": any(record["truncated"] for record in records),
+        "results": results,
+        "engine_outcomes": records,
+        "all_failed": all_failed,
+    }
+    sections = [outcome.text if outcome.text.startswith("Search Engine: ")
+                else f"Search Engine: {name}\n{outcome.text}" for name, outcome in outcomes]
+    return SearchOutcome(
+        text=f"Search Engine: All ({len(outcomes)} engines, limit {resolved_limit} per engine)\n\n"
+             + "\n\n".join(sections),
+        structured=structured,
+        is_error=all_failed,
+    )
+
+
 async def _run_search(
     source: str,
     engine: str,
     extra_params_json: Optional[str],
     limit: Any,
+    *,
+    prepared_input: dict[str, Any] | None = None,
 ) -> SearchOutcome:
     # 先校验输入，再创建网络请求。
     if engine not in ENGINES:
@@ -450,7 +595,7 @@ async def _run_search(
         raise SearchInputError(f"source 需要字符串，收到 {type(source).__name__}")
 
     # 2. 准备搜索输入（URL 可能由我们自己抓，见 _prepare_search_input）
-    search_args = await _prepare_search_input(engine, source)
+    search_args = prepared_input if prepared_input is not None else await _prepare_search_input(engine, source)
 
     # 3. 凭据与出站配置
     credentials = load_engine_credentials(engine)
@@ -590,7 +735,7 @@ def _format_response(engine: str, response: Any, limit: int) -> SearchOutcome:
 )
 async def search_image(
     source: str,
-    engine: str = "Yandex",
+    engine: Optional[str] = None,
     extra_params_json: Optional[str] = None,
     limit: StrictInt = DEFAULT_LIMIT,
 ) -> ToolResult:
@@ -605,7 +750,8 @@ async def search_image(
                 3. Do NOT provide a local file path — the server does not read
                    local files, and such input is rejected.
 
-        engine: The search engine to use (default: "Yandex").
+        engine: The search engine to use. If omitted or null, use IMAGE_SEARCH_DEFAULT_ENGINE,
+                falling back to Yandex. Names are case-insensitive. All queries every engine.
                 Other supported engines: SauceNAO, Google, TraceMoe, Ascii2D, EHentai, etc.
                 Use the `get_engine_info` tool to see the full list and capabilities.
 
@@ -616,6 +762,9 @@ async def search_image(
         limit: Max number of results to return (1-50, default: 5).
     """
     outcome = await _search_image_logic(source, engine, extra_params_json, limit)
+    if outcome.structured is not None and "engine_outcomes" in outcome.structured:
+        return ToolResult(content=outcome.text, structured_content=outcome.structured,
+                          is_error=outcome.is_error)
     if outcome.is_error:
         # 使用 ToolError 返回工具执行错误。
         raise ToolError(outcome.text)

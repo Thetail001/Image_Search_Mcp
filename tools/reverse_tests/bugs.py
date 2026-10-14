@@ -138,8 +138,8 @@ INJECTIONS: tuple[BugInjection, ...] = (
     BugInjection(
         name="readme-bad-param-name",
         path="README.md",
-        old=r'\"cut_borders\": false',
-        new=r'\"cutBorders\": false',
+        old=r'"extra_params_json": "{\"cut_borders\": false}"',
+        new=r'"extra_params_json": "{\"cutBorders\": false}"',
         test=(
             "tests/test_readme_examples.py"
             "::test_readme_examples_have_valid_extra_params"
@@ -454,19 +454,11 @@ INJECTIONS: tuple[BugInjection, ...] = (
         name="tool-error-returned-as-normal-result",
         path="src/image_search_mcp/server.py",
         old=(
-            (
-            '    outcome = await _search_image_logic(source, engine, extra_params_json, limit)\n'
             '    if outcome.is_error:\n'
             '        # 使用 ToolError 返回工具执行错误。\n'
             '        raise ToolError(outcome.text)\n'
-            '    return ToolResult(content=outcome.text, structured_content=outcome.structured)'
-        )
         ),
-        new=(
-            "    outcome = await _search_image_logic(source, engine, extra_params_json, limit)\n"
-            "    # 注入：把失败当正常结果返回\n"
-            "    return ToolResult(content=outcome.text, structured_content=outcome.structured)"
-        ),
+        new="    # 注入：把失败当正常结果返回\n",
         test="tests/test_mcp_contract.py::test_input_rejections_come_back_as_is_error",
         why="失败退化成「看起来正常的结果」，客户端与模型都无法区分",
     ),
@@ -664,6 +656,54 @@ INJECTIONS: tuple[BugInjection, ...] = (
             "::test_failed_authentication_probe_fails_deployment[500]"
         ),
         why="鉴权检查失败后仍报告更新成功",
+    ),
+    BugInjection(
+        name="configured-default-ignored",
+        path="src/image_search_mcp/server.py",
+        old='        requested = (os.environ.get(DEFAULT_ENGINE_ENV) or DEFAULT_ENGINE).strip() or DEFAULT_ENGINE',
+        new='        requested = DEFAULT_ENGINE',
+        test="tests/test_multi_engine.py::test_default_is_resolved_at_each_call",
+        why="忽略默认引擎的环境配置",
+    ),
+    BugInjection(
+        name="all-concurrency-unbounded",
+        path="src/image_search_mcp/server.py",
+        old="    semaphore = asyncio.Semaphore(ALL_CONCURRENCY)",
+        new="    semaphore = asyncio.Semaphore(len(ENGINES))",
+        test="tests/test_multi_engine.py::test_all_bounds_concurrency",
+        why="一次 All 查询同时占用全部引擎连接",
+    ),
+    BugInjection(
+        name="all-total-deadline-removed",
+        path="src/image_search_mcp/server.py",
+        old="        _, pending = await asyncio.wait(tasks.values(), timeout=SEARCH_TOTAL_TIMEOUT)",
+        new="        _, pending = await asyncio.wait(tasks.values(), timeout=None)",
+        test="tests/test_multi_engine.py::test_all_timeouts_cancel_pending_work[0.04-1.0]",
+        why="排队任务继续运行，整次查询超过总期限",
+    ),
+    BugInjection(
+        name="all-engine-timeout-removed",
+        path="src/image_search_mcp/server.py",
+        old="                    ALL_ENGINE_TIMEOUT,",
+        new="                    SEARCH_TOTAL_TIMEOUT,",
+        test="tests/test_multi_engine.py::test_all_timeouts_cancel_pending_work[1.0-0.04]",
+        why="单个慢引擎占满总期限，排队引擎无法执行",
+    ),
+    BugInjection(
+        name="all-credentials-routed-to-wrong-engine",
+        path="src/image_search_mcp/server.py",
+        old="    credentials = load_engine_credentials(engine)",
+        new='    credentials = load_engine_credentials("Yandex")',
+        test="tests/test_multi_engine.py::test_all_uses_separate_clients_and_scoped_credentials",
+        why="引擎未获取自身的凭据",
+    ),
+    BugInjection(
+        name="all-failures-marked-successful",
+        path="src/image_search_mcp/server.py",
+        old="        is_error=all_failed,",
+        new="        is_error=False,",
+        test="tests/test_multi_engine.py::test_all_failures_are_a_structured_tool_error",
+        why="全部引擎失败时仍将整个调用标记为成功",
     ),
 )
 

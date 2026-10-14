@@ -1,18 +1,4 @@
-"""门禁：``tests/`` 下的测试源码不许被 .gitignore 吞掉。
-
-为什么值得一道门禁：被忽略的测试文件在本地跑得好好的，却永远不会提交 ——
-CI 上一片绿，别人的机器上什么都不跑，而"只在本机存在"的测试是最难查的一类问题。
-实测过一次：``.gitignore`` 里 ``test_logic.py`` 没锚定到仓库根，
-于是它会匹配任意目录下的同名文件，将来往 ``tests/`` 里放一个就会被静默吞掉。
-
-**这道门禁刻意写窄**：只关心 ``.py`` 源码。早期版本把 ``tests/`` 下**所有**
-被忽略的文件都算问题，结果每次都被 ``__pycache__/*.pyc`` 报红 ——
-那种误报的门禁活不了几天，最后只会被人关掉，比没有门禁更糟。
-
-用法：
-    python tools/gate_tests_not_ignored.py            # 检查当前仓库
-    python tools/gate_tests_not_ignored.py --self-test # 反向自检门禁自己
-"""
+"""检查：``tests/`` 下的测试源码不许被 .gitignore 吞掉。"""
 
 from __future__ import annotations
 

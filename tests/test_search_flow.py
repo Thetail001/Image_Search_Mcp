@@ -1,8 +1,4 @@
-"""搜索流程：输入路由、凭据注入、limit 边界、错误出口。
-
-用 TraceMoe 做主路径 —— 它是 JSON 接口，能造出干净的合成响应，
-于是"请求真的发出去了"和"凭据真的带上了"这两件事都能直接观察。
-"""
+"""搜索流程：输入路由、凭据注入、limit 边界、错误出口。"""
 
 from __future__ import annotations
 
@@ -303,12 +299,7 @@ async def test_no_results_is_not_an_error(http_log):
 
 
 async def test_upstream_explicit_error_is_not_reported_as_no_results(http_log):
-    """上游明确报错 ≠ 没搜到（复核报告第 3 问）。
-
-    旧实现只看 ``if not raw``：上游把错误写进 ``error`` 字段、结果为空，
-    就会被报成成功的 "No results found."，协议层是 ``isError=false`` ——
-    调用方以为"这张图全网没有"，而不是"这次搜索失败了"。
-    """
+    """上游明确报错 ≠ 没搜到（复核报告第 3 问）。"""
     seen, state = http_log
     state["search_payload"] = {
         "frameCount": 0,

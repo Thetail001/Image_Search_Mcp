@@ -1,31 +1,4 @@
-"""凭据的归属与出站范围。
-
-== 为什么需要这个模块 ==
-
-早期版本只有一个全局 ``IMAGE_SEARCH_COOKIES``，并且把它原样塞给 ``httpx``：
-
-    AsyncClient(cookies={"sid": "..."})     # 无 domain 的 dict 形式
-
-实测结果是**这个 cookie 会被发给任意域名**，包括与引擎完全无关的站点::
-
-    https://yandex.com/a         Cookie=sid=ENGINE_COOKIE
-    https://untrusted.invalid/b  Cookie=sid=ENGINE_COOKIE   ← 也发了
-    https://api.trace.moe/c      Cookie=sid=ENGINE_COOKIE   ← 也发了
-
-换 ``httpx.Cookies()`` 显式 ``domain="yandex.com"`` 之后，无关域名拿到的是 ``None``。
-所以"限域"是有效的 —— 而"每次新建一个 client"**并不提供隔离**：cookie 本身没有域，
-换个 client 它照样跟着走。
-
-== 三条规矩 ==
-
-1. **凭据必须有明确归属。** 全局配置没有归属信息，无法判断它该发给谁 ——
-   与其猜，不如拒绝，并告诉调用方怎么改。归属不明就是拒绝（不是"禁用一下继续跑"）。
-2. **限域到该引擎真正访问的域名**，由下面的 ``COOKIE_DOMAINS`` 表决定；
-   表里的每个域名都由 ``tests/test_credentials.py`` 对着上游源码核验。
-3. **代理不接受隐式来源。** 早期版本会退回读 ``HTTP_PROXY``/``HTTPS_PROXY`` ——
-   用户没配过它也会命中，而带凭据的请求悄悄走一个不知从哪来的代理是不可接受的行为。
-   现在只认显式的 ``IMAGE_SEARCH_PROXY``；检测到通用代理变量时会明确提示被忽略。
-"""
+"""按引擎读取凭据，构造域名受限的 HTTPS Cookie jar，并校验显式代理配置。"""
 
 from __future__ import annotations
 
@@ -39,11 +12,7 @@ from urllib.parse import urlparse
 import httpx
 
 # --------------------------------------------------------------------------
-# 引擎 → 凭据应发往的域名
-#
-# 这张表来自对上游各引擎源码里出现的 HTTP 主机名的实测（见测试里的核验）。
-# 取"父域"而不是精确主机：httpx 的 domain= 会连子域一起匹配
-# （domain="trace.moe" 覆盖 api.trace.moe，domain="iqdb.org" 覆盖 3d.iqdb.org）。
+# 域名表按上游请求目标维护；父域同时匹配子域。
 # --------------------------------------------------------------------------
 
 COOKIE_DOMAINS: dict[str, tuple[str, ...]] = {
@@ -68,14 +37,10 @@ LEGACY_COOKIE_VAR = "IMAGE_SEARCH_COOKIES"
 LEGACY_OWNER_VAR = "IMAGE_SEARCH_COOKIES_ENGINE"
 #: 显式代理（唯一被接受的代理来源）
 PROXY_VAR = "IMAGE_SEARCH_PROXY"
-#: 这些变量**不再被使用**，出现时给出提示
+#: 这些变量不再被使用，出现时给出提示
 IGNORED_PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
 
-#: cookie 名称必须是 token 字符。
-#: 旧写法 ``^[^=;]+=[^=;]*$`` 一处错两个方向：名称那半允许空格与控制字符
-#: （``bad name=x`` 会被接受），值那半又禁掉 ``=``，而 base64/URL 编码的值里
-#: ``=`` 很常见（``sid=YWJjZA==`` 被误拒）。
-#: 上游按**第一个** ``=`` 拆（``PicImageSearch/network.py:51-54``），这里跟它对齐。
+#: Cookie 名称只接受 token 字符，值允许包含等号。
 _COOKIE_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 #: 值里禁止控制字符与片段分隔符 ``;``；``=`` 允许保留。
 _COOKIE_VALUE_FORBIDDEN = re.compile(r"[\x00-\x1f\x7f;]")
@@ -94,17 +59,7 @@ class CredentialError(ValueError):
 # --------------------------------------------------------------------------
 
 def normalize_cookie_string(raw: str, *, engine: str) -> str:
-    """校验并规范化 cookie 串，返回**字符串**。
-
-    上游 ``Network.__init__`` 对 cookies 参数调用 ``.split(";")`` —— 它要的是字符串。
-    早期版本这里返回 ``dict``，于是任何**非空**配置都必然抛
-    ``AttributeError: 'dict' object has no attribute 'split'``：
-    照 README 配置的人 100% 失败。
-
-    这里同时做格式校验，因为上游自己的解析是
-    ``line.strip().split("=", 1)`` —— 遇到不带 ``=`` 的片段会直接抛 ValueError，
-    报错信息里看不出是配置问题。提前校验能给出可操作的提示。
-    """
+    """校验 Cookie 名称和值，返回规范化的字符串。错误信息不包含凭据值。"""
     if not isinstance(raw, str):
         raise CredentialError(
             f"{engine} 的 cookies 必须是字符串，收到 {type(raw).__name__}",
@@ -125,9 +80,7 @@ def normalize_cookie_string(raw: str, *, engine: str) -> str:
 
     for index, segment in enumerate(segments, start=1):
         name, sep, value = segment.partition("=")
-        # 错误信息只给**片段序号**，不回显片段内容：旧写法把整个 ``segment!r``
-        # 拼进消息，而它会经 server.py 的错误出口返回给调用方，
-        # 等于把凭据值写进对方日志（A 报告 A4）。
+        # 错误信息仅给出片段序号，避免回显凭据。
         if not sep:
             raise CredentialError(
                 f"{engine} 的 cookies 第 {index} 个片段不带 '='，缺少值",
@@ -153,17 +106,7 @@ def normalize_cookie_string(raw: str, *, engine: str) -> str:
 
 
 def build_cookie_jar(cookie_string: str, *, domains: tuple[str, ...]) -> httpx.Cookies:
-    """构造**限域且仅 HTTPS** 的 cookie jar。
-
-    这两个都不是默认行为，必须显式做：
-
-    1. **限域**：用 ``httpx.Cookies().set(..., domain=...)`` 而不是 ``cookies={...}`` ——
-       后者产生的 cookie 没有域，会跟着请求发往任何域名。
-    2. **仅 HTTPS**：``Cookies.set()`` 内部构造的 ``Cookie`` 是 ``secure=False``，
-       也就是 ``http://yandex.com/`` 这个明文地址也会带上凭据（复核报告 B4，已实测）。
-       ``Cookies.set()`` **没有** secure 参数，所以这里直接建 ``http.cookiejar.Cookie``
-       把 ``secure`` 打开。代价是引擎若走 http:// 就拿不到 cookie —— 这正是想要的结果。
-    """
+    """构造仅匹配指定域名、仅通过 HTTPS 发送的 Cookie jar。"""
     jar = httpx.Cookies()
     for segment in cookie_string.split(";"):
         segment = segment.strip()
@@ -200,25 +143,10 @@ def strip_inherited_proxies(
     *,
     explicit_proxy: bool = False,
 ) -> tuple[str, ...]:
-    """拆掉 httpx **构造时从环境变量继承**来的代理挂载，返回被拆掉的 pattern。
+    """移除 httpx 在构造时继承的环境代理，保留显式配置的代理。
 
-    == 为什么不能靠 trust_env ==
-
-    ``trust_env`` 是**构造参数**。httpx 在 ``AsyncClient.__init__`` 里就把
-    ``get_environment_proxies()`` 编译成 URLPattern 挂进 ``_mounts``
-    （``httpx/_client.py:242-249``），而 ``_transport_for_url`` 之后**只看** ``_mounts``
-    （同文件 760-769）。所以在别人构造好的 client 上再改 ``_trust_env`` 是无效的 ——
-    这样一来"环境代理不生效"这个承诺在端到端上原本是空的：带凭据的引擎请求会
-    悄悄走一个不知从哪来的代理（复核报告 B5）。
-
-    == 为什么判定依据是"我们自己配没配代理" ==
-
-    不能靠"看到 mount 就拆"：显式 ``proxy=`` 也会挂出形状完全一样的 ``all://`` mount，
-    两者在对象上看不出区别。唯一可靠的依据是我们自己的配置：
-    只有**没有**配 ``IMAGE_SEARCH_PROXY`` 时，client 上的代理才只可能来自环境。
-
-    ``value 为 None`` 的 mount 不是代理，它表示"用默认 transport"，不动它。
-    """
+    httpx 已将代理写入 _mounts，事后修改 trust_env 不会改变路由。
+    此处依赖 httpx 的内部属性，升级时需验证代理集成测试。"""
     if explicit_proxy:
         return ()
 
@@ -262,11 +190,7 @@ def load_engine_credentials(
     engine: str,
     env: Mapping[str, str] | None = None,
 ) -> EngineCredentials | None:
-    """读出该引擎的凭据，或返回 None（表示没配）。
-
-    **归属不明的全局配置会被拒绝**，不是静默忽略也不猜测。原因很直接：
-    没有归属就不知道该发给谁，发错了就是凭据泄露。
-    """
+    """优先读取引擎专属 Cookies，再读取归属明确的旧全局配置。未配置时返回 None。"""
     env = os.environ if env is None else env
 
     scoped_var = f"{COOKIE_VAR_PREFIX}_{engine.upper()}"
@@ -312,13 +236,7 @@ class ProxyConfig:
 
 
 def _described_proxy(raw: str) -> str:
-    """给错误信息用的代理描述：**只留结构与是否带凭据，绝不含 userinfo**。
-
-    ``http://user:pass@host`` 的原文里就写着密码，而 CredentialError 会被
-    server.py 回给工具调用方。cookie 那条同类路径当时已经脱敏，proxy 这条漏了
-    （复核报告：错误代理 URL 回显 secret）。连 URL 都解析不出来的输入，
-    更没有理由把原文倒回去。
-    """
+    """生成不含用户名和密码的代理描述，用于配置错误提示。"""
     try:
         parsed = urlparse(raw)
     except ValueError:
@@ -334,16 +252,7 @@ def _described_proxy(raw: str) -> str:
 
 
 def load_proxy(env: Mapping[str, str] | None = None) -> ProxyConfig | None:
-    """读出显式配置的代理。
-
-    **不读** ``HTTP_PROXY`` / ``HTTPS_PROXY``。早期版本会退回读它们，结果是：
-    用户从没配过代理，却因为环境里有这个变量而让带凭据的请求走了某个代理；
-    而且那条路径本身是坏的（传 dict 给只吃字符串的参数，直接抛
-    ``AttributeError: 'dict' object has no attribute 'url'``）。现在只认显式配置。
-
-    所有报错都只回 ``_described_proxy`` 的结构化描述；原文（可能含密码）不出现
-    在任何异常消息里。
-    """
+    """读取并校验 IMAGE_SEARCH_PROXY，不使用通用代理变量。"""
     env = os.environ if env is None else env
 
     raw = (env.get(PROXY_VAR) or "").strip()
@@ -398,13 +307,7 @@ def ignored_proxy_vars(env: Mapping[str, str] | None = None) -> list[str]:
 # --------------------------------------------------------------------------
 
 def install_cookie_jar(client: httpx.AsyncClient, jar: httpx.Cookies) -> None:
-    """把限域 jar 装到真正的 httpx client 上。
+    """将 Cookie jar 装到 Network 上下文返回的 httpx client。
 
-    注意装的位置：``Network`` 本身**接不了** jar —— 它对 cookies 调 ``.split()``::
-
-        Network(cookies=CookieJar) → AttributeError: 'Cookies' object has no attribute 'split'
-
-    可行做法是：``Network`` 不接收 cookie 字符串，等它交出内部的真实 client
-    （``async with Network(...) as net`` 的 ``net`` 就是这个 client），再往它上面装域限定的 jar。
-    """
+    Network 的 cookies 参数只接受字符串，无法直接接收域名受限的 jar。"""
     client.cookies.update(jar)

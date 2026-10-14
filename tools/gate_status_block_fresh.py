@@ -1,32 +1,5 @@
 #!/usr/bin/env python3
-"""门禁：文档里那一段「当前状态」必须是刚生成的，不能是过期的手抄数字。
-
-为什么需要这道门禁
-------------------
-那一段写的全是**能从产物取到的事实**：测试条数、注入条数、源码行数、契约覆盖数。
-实测踩过：加了测试、改了文件却忘了重新生成，文档就一直写着测试 367 条
-（实际 390）、注入 31 条（实际 36），还漏掉了一个新增的测试文件。
-**过期的入口文档比空白更糟** —— 它会让人按错的数字去排查。
-
-做法
-----
-把文档复制到临时目录，在副本上跑**同一个生成器**（``tools/status.py --update``），
-再把两边的生成段抽出来逐行比较。
-
-刻意**复用生成器自己的标记常量**（``MARKER_START`` / ``MARKER_END``）来定位那一段，
-不在这里另写一套扫描：两套定位逻辑必然分歧 —— 哪天标记或格式改了，
-另一套会**悄悄失效**（自己不报错，只是再也抓不到东西，比没有门禁更坏）。
-
-比较时**忽略**「相对基线的改动：N 个未提交文件」这一行：它随工作区状态变化，
-手里只要有一个没提交的文件就会不一样，门禁就变成了"永远是红的"。
-会误报的门禁最后只会被关掉，所以宁可窄一点。
-
-用法
-----
-    python tools/gate_status_block_fresh.py               # 检查真实文档
-    python tools/gate_status_block_fresh.py --doc X.md    # 检查指定文档（自检用）
-    python tools/gate_status_block_fresh.py --self-test   # 反向自检：过期数字必须被抓
-"""
+"""重新生成文档统计并比较，忽略分支和工作区状态等环境信息。"""
 
 from __future__ import annotations
 
@@ -167,19 +140,14 @@ def self_test() -> int:
 
         # 情形 4：分支/基线行不同 → 必须**仍然通过**（CI 里就是这种情形）
         other_branch = tmpdir / "other-branch.md"
-        swapped = re.sub(r"^- 分支：`[^`]*`", "- 分支：`main`", text, count=1, flags=re.M)
-        if swapped == text:
-            failures.append("情形 4 预处理失败：没能改到分支那一行")
+        # 在生成区块内加入旧格式的环境信息，确认它仍被忽略。
+        swapped = text.replace("- 引擎：", "- 分支：`main`\n- 引擎：", 1)
+        other_branch.write_text(swapped, encoding="utf-8")
+        code = check(other_branch)
+        if code != 0:
+            failures.append(f"情形 4：环境信息导致误报（退出码 {code}）")
         else:
-            other_branch.write_text(swapped, encoding="utf-8")
-            code = check(other_branch)
-            if code != 0:
-                failures.append(
-                    f"情形 4：只有分支行不同却判不通过（退出码 {code}）"
-                    " —— CI 里分支是 main，这会让门禁误报"
-                )
-            else:
-                print("情形 4 通过：分支行不同不被判为过期（CI 安全）")
+            print("情形 4 通过：环境信息不影响统计比较")
 
         # 情形 3：标记被删掉 → 必须响亮失败，不能静默通过
         broken_doc = tmpdir / "broken.md"

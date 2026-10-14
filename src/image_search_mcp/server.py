@@ -1,27 +1,4 @@
-"""MCP 工具实现。
-
-== 与本模块相关的历史缺陷 ==
-
-1. **服务端任意文件读取**（最严重）。旧代码在把 ``file``/``url`` 装好之后执行
-   ``search_kwargs.update(extra_params)``，于是调用方能用一个 ``{"file": "/etc/passwd"}``
-   覆盖输入；上游 ``utils.read_file()`` 接受路径字符串并直接 ``open()``，
-   读出来的内容还会被 multipart 上传到引擎站点（本机与远端各验证过一次）。
-   现在 ``extra_params`` 走 :mod:`image_search_mcp.params` 的白名单，保留键一律拒绝。
-
-2. **拿 dict 当字符串传**。旧的 ``_parse_cookies()`` / ``_parse_proxy()`` 返回 dict，
-   而 ``Network.__init__`` 对它们调用 ``.split()`` / ``.url`` —— 任何**非空**配置必炸，
-   而 README 恰好把这两个变量写成"遇到验证就这样配"。现在按库的契约传字符串，
-   且 cookie 限域（见 :mod:`image_search_mcp.credentials`）。
-
-3. **凭据无归属、无域**。旧代码把 cookie 塞给 ``httpx`` 的无域 dict 形式，
-   实测会发往任意域名。现在按引擎取凭据、限域到该引擎真正访问的域名。
-
-4. **traceback 回给调用方**。旧代码把完整堆栈（含服务端绝对路径）拼进返回值。
-   现在详细堆栈只进日志。
-
-5. **本机替用户抓图无任何校验**（EHentai / BaiDu）。现在改由
-   :mod:`image_search_mcp.safe_download` 接管，引擎只拿到字节。
-"""
+"""MCP 工具、图片输入处理与搜索结果格式化。"""
 
 from __future__ import annotations
 
@@ -38,12 +15,9 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
+from pydantic import StrictInt
 
-# 为什么**不再**兜底导入 ``mcp.server.fastmcp``：mcp 2.x 已经把它改名成
-# ``mcp.server.mcpserver.MCPServer``（API 也变了）。那条兜底路径在当前依赖下
-# 只会抛 "No module named 'mcp.server.fastmcp'"，把"没装 fastmcp"这个真实原因
-# 掩盖成一条看不出所以然的错误。pyproject 里 ``fastmcp>=4.0`` 是硬依赖，
-# 所以直接硬导入：缺了就是缺了，报错也要报得能看懂。
+# FastMCP 是直接依赖，缺失时直接报告导入错误。
 
 from PicImageSearch import (
     Ascii2D,
@@ -113,23 +87,14 @@ class SearchInputError(ValueError):
 
 @dataclass(frozen=True)
 class SearchOutcome:
-    """一次搜索的结果，同时带着"给人看的文本"和"给机器看的结构"。
-
-    为什么不让 ``_search_image_logic`` 直接返回字符串：那样工具层就无法区分
-    "搜到了但没结果"与"搜索失败"，而 MCP 规范要求把后者用 ``isError: true``
-    返回，客户端和模型才能据此自我修正（复核报告 A 的
-    "no result 与 search failed 不可区分"）。
-    """
+    """搜索的文本结果、结构化结果和错误状态。"""
 
     text: str
     structured: dict[str, Any] | None = None
     is_error: bool = False
 
 
-#: 搜索工具的输出契约。
-#: 只声明**各引擎通用**的四个字段 —— 字段少而形状确定，比字段多而形状不定更有用：
-#: 输出 schema 一旦虚设，客户端就没法真的依赖它。引擎特有字段（episode、
-#: author_url 等）仍然只在文本里。
+#: 结构化输出声明通用字段；引擎专属字段保留在文本中。
 SEARCH_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -158,7 +123,7 @@ SEARCH_OUTPUT_SCHEMA: dict[str, Any] = {
     "required": ["engine", "result_count", "returned", "truncated", "results"],
 }
 
-#: 搜索是**只读**且会访问外部服务；不声明这两点，客户端只能一律当危险操作处理。
+#: 搜索是只读且会访问外部服务；不声明这两点，客户端只能一律当危险操作处理。
 SEARCH_ANNOTATIONS = ToolAnnotations(
     read_only_hint=True,
     idempotent_hint=True,
@@ -181,11 +146,7 @@ def _text_or_none(value: Any) -> str | None:
 
 
 def _similarity_or_none(value: Any) -> float | str | None:
-    """相似度原样保留，只挡掉布尔与复杂对象。
-
-    ``isinstance(True, int)`` 为真，所以布尔要先排除 —— 否则 ``True`` 会变成
-    ``"True%"`` 那种东西进到结构化输出里。
-    """
+    """保留数值或字符串相似度，排除布尔值与复杂对象。"""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float, str)):
@@ -234,10 +195,7 @@ def get_engine_info(engine_name: str = "all") -> str:
         if name.lower() == engine_name.lower():
             return params.engine_details(name)
 
-    # 按 MCP 规范，"输入不对、模型可以自己改"的失败属于工具执行错误 → isError=true。
-    # 旧写法把 "Error: ..." 当**正常结果**返回，客户端无法与真正的结果区分。
-    # 用 ToolError 而不是让 ValueError 冒出去：后者的消息会被 fastmcp 加上
-    # "Error calling tool 'x': " 前缀（实测），对模型只是噪音。
+    # 使用 ToolError 返回工具执行错误。
     raise ToolError(
         f"Engine '{engine_name}' not found. Supported: {', '.join(params.CONTRACTS)}"
     )
@@ -248,17 +206,7 @@ def get_engine_info(engine_name: str = "all") -> str:
 # --------------------------------------------------------------------------
 
 def _format_result_item(item: Any, engine: str) -> str:
-    """把单个结果项格式化成文本。
-
-    注意两个容易写错的地方：
-
-    - **零值要被当成有值**。``episode=0`` 与 ``To=0`` 在旧代码里被真值判断吞掉：
-      ``if item.episode`` 对 0 为假，集数直接消失；``end_time if end_time else '?'``
-      把 0 显示成问号。判断"有没有值"必须用 ``is not None``。
-    - **不要在这里丢字段**。旧代码的 SauceNAO 分支不读 ``similarity`` 与
-      ``author_url``，而同一份对象交给 Iqdb 分支时 ``similarity`` 是会输出的 ——
-      同一类信息在不同引擎下时有时无。
-    """
+    """格式化单条结果，保留集数和时间点等字段的零值。"""
     lines: list[str] = []
 
     # 通用字段
@@ -395,12 +343,7 @@ def _resolve_limit(limit: Any) -> int:
 # --------------------------------------------------------------------------
 
 def _load_extra_params(raw: Optional[str]) -> dict:
-    """解析 ``extra_params_json``。
-
-    三种"没有参数"的写法都接受：字段省掉、空字符串、以及 JSON 字面量 ``null``。
-    客户端把可选字段序列化成 ``null`` 是常见做法，为此报错没有意义。
-    **但数组和标量不在此列** —— 那些是调用方搞错了形态，必须报错而不是当成空。
-    """
+    """解析附加参数 JSON。省略、空字符串和 JSON null 均表示没有参数。"""
     if raw is None or raw == "":
         return {}
     try:
@@ -413,19 +356,7 @@ def _load_extra_params(raw: Optional[str]) -> dict:
 
 
 def _build_network_kwargs() -> tuple[dict, Any]:
-    """组装 Network 的构造参数。
-
-    ``Network`` 的 ``cookies`` / ``proxies`` 都只吃**字符串**：
-
-    - cookies 会被 ``cookies.split(";")`` 处理
-    - proxies 会直接交给 httpx 的 ``proxy=`` 参数
-
-    旧代码两边都传 dict，于是任何非空配置必然抛
-    ``AttributeError: 'dict' object has no attribute 'split'`` / ``no attribute 'url'``。
-
-    注意这里**不传 cookies** —— cookie 需要限域，而 ``Network`` 接不了域限定的
-    ``Cookies`` 对象（它对入参调 ``.split()``）。做法是等它交出内部真实 client 之后再装。
-    """
+    """组装 Network 参数。代理来自显式配置，Cookies 在 client 创建后安装。"""
     kwargs: dict[str, Any] = {}
 
     proxy = load_proxy()
@@ -443,12 +374,7 @@ def _build_network_kwargs() -> tuple[dict, Any]:
 
 
 def _make_downloader() -> SafeDownloader:
-    """构造取图下载器。
-
-    单独抽一个工厂，是为了给测试留一个**清晰的注入点** ——
-    测试要注入受控解析器与连接层，才能观察"连接层实际收到的目的地址"
-    （只断言 URL 字符串是测不到 DNS 那一步的）。
-    """
+    """构造图片下载器；测试可替换此工厂以注入受控连接。"""
     return SafeDownloader()
 
 
@@ -456,14 +382,7 @@ async def _prepare_search_input(
     engine: str,
     source: str,
 ) -> dict[str, Any]:
-    """决定这次搜索给引擎什么输入。
-
-    **本机抓图的引擎（EHentai / BaiDu）不走引擎内部那条无校验的下载路径** ——
-    我们自己用 :class:`SafeDownloader` 把它取回来，再把字节交给引擎。
-    其余引擎把 URL 直接交给搜索站点去抓，那不是本机的出站面。
-
-    决策标准只认 `ENGINES_THAT_FETCH_LOCALLY`，它由测试对着上游源码核验。
-    """
+    """准备图片输入。EHentai 和 BaiDu 的 URL 由安全下载器取回，其余引擎直接接收 URL。"""
     trimmed = source.strip()
 
     if not trimmed.lower().startswith(("http://", "https://")):
@@ -483,15 +402,7 @@ async def _search_image_logic(
     extra_params_json: Optional[str] = None,
     limit: int = DEFAULT_LIMIT,
 ) -> SearchOutcome:
-    """图片搜索的核心逻辑（与 MCP 工具层分开，便于直接测试）。
-
-    **失败不抛，而是带 ``is_error`` 返回**：工具层要把它翻成 MCP 的
-    ``isError: true``，而"让异常冒出去"那条路的文本会被 fastmcp 加上
-    ``Error calling tool 'x': `` 前缀（实测），对模型只是噪音。
-
-    错误文本保留 ``Error: `` 前缀是**刻意的**：这样只看文本的客户端行为不变，
-    协议感知的客户端才拿 ``isError`` 做判断 —— 协议升级应当是加法。
-    """
+    """执行搜索，将输入、配置和上游异常整理成 SearchOutcome。"""
     try:
         return await _run_search(source, engine, extra_params_json, limit)
     except SearchInputError as exc:
@@ -508,11 +419,7 @@ async def _search_image_logic(
             text=f"Error: 取图失败 [{exc.reason}] {exc}", is_error=True
         )
     except Exception as exc:  # noqa: BLE001 - 兜底：对外只给简短信息，细节进日志
-        # 旧代码把 traceback.format_exc() 拼进返回值 —— 那会泄露服务端绝对路径，
-        # 而且对调用方没有用处。详细堆栈留在日志里。
-        #
-        # 这里刻意**不拼接 str(exc)**：异常消息里可能带文件路径、URL、凭据片段。
-        # 只留异常类型名，够定位是哪一类问题了。
+        # 详细堆栈仅写入日志，客户端只接收异常类型。
         logger.exception("图片搜索失败 engine=%s", engine)
         return SearchOutcome(
             text=(
@@ -529,10 +436,7 @@ async def _run_search(
     extra_params_json: Optional[str],
     limit: Any,
 ) -> SearchOutcome:
-    # 1. 先校验调用方输入 —— 顺序很重要：**任何拒绝都要发生在读文件与建网络之前**
-    #
-    # 引擎名校验排在最前：它比"参数契约不存在"更能说清问题出在哪，
-    # 也不该让一个拼错的引擎名以别的名字报出来。
+    # 先校验输入，再创建网络请求。
     if engine not in ENGINES:
         raise SearchInputError(
             f"不支持的引擎 '{engine}'。用 get_engine_info('all') 查看可用列表。"
@@ -563,10 +467,7 @@ async def _run_search(
     engine_cls = ENGINES[engine]
 
     async with Network(**network_kwargs) as net:
-        # httpx 默认 trust_env=True，而且在**构造时**就把环境里的代理挂进了 _mounts，
-        # 事后改 trust_env 是无效的（见 credentials.strip_inherited_proxies 的说明）。
-        # 不拆掉的话，"环境代理不生效"这个承诺是空的 —— 带凭据的请求会走一个
-        # 不知从哪来的代理（复核报告 B5）。
+        # 移除 Network client 在构造时继承的环境代理，保留显式代理。
         dropped = strip_inherited_proxies(net, explicit_proxy=explicit_proxy is not None)
         if dropped:
             logger.warning(
@@ -576,7 +477,7 @@ async def _run_search(
             )
 
         if credentials is not None:
-            # 装**域限定**的 jar：只发给该引擎真正访问的域名。
+            # 装域限定的 jar：只发给该引擎真正访问的域名。
             # Network 接不了 Cookies 对象，所以装到它交出的真实 client 上。
             install_cookie_jar(net, credentials.jar())
             logger.debug("已为 %s 装载限域 cookies（来源 %s）", engine, credentials.source)
@@ -596,11 +497,7 @@ _UPSTREAM_ERROR_ATTRS: dict[str, tuple[str, ...]] = {
 
 
 def _redact_upstream(message: str, limit: int = 200) -> str:
-    """上游文本进工具结果前先脱敏截断。
-
-    以 data URI 形式传入的图（Base64）可能被上游的错误信息整段倒回来 ——
-    那不是该回给调用方的东西，也撑爆文本块。
-    """
+    """隐藏上游错误文本中的 Base64 data URI，并限制文本长度。"""
     text = re.sub(
         r"data:[\w.+-]+/[\w.+-]+;base64,[A-Za-z0-9+/=]+", "data:<redacted>", message
     )
@@ -609,16 +506,7 @@ def _redact_upstream(message: str, limit: int = 200) -> str:
 
 
 def _upstream_error(engine: str, response: Any) -> Optional[str]:
-    """上游**明确**报错了吗？没有明确信号就返回 None。
-
-    为什么必须有这一步：``raw`` 为空有两种截然不同的成因 —— "搜到了但没有匹配"
-    与 "上游明确报错"。旧代码只看 ``if not raw``，把两者都算成成功空结果，
-    于是明确失败被报成 ``is_error=False``（复核报告第 3 问：用真 TraceMoeResponse
-    走完整工具链复现，上游 ``error`` 字段非空却返回 "No results found."）。
-
-    反向的错误也要避免：不能把所有空 raw 都判成失败 —— HTML 引擎空解析可能只是
-    没匹配，凭空断言"触发了机器人验证"同样是假装知道。
-    """
+    """读取引擎明确提供的错误字段；没有错误信号时返回 None。"""
     if response is None:
         return None  # 交由调用方按"响应契约错误"处理
 
@@ -636,14 +524,9 @@ def _upstream_error(engine: str, response: Any) -> Optional[str]:
 
 
 def _format_response(engine: str, response: Any, limit: int) -> SearchOutcome:
-    """把上游响应同时整理成"人读文本"和"机器可读结构"。
+    """同时生成文本和结构化搜索结果。
 
-    关于规范里那条"返回结构化内容的工具 SHOULD 同时把序列化 JSON 放进文本块"：
-    我们**没有**满足它。这是有理由的偏离，但如实记成偏离 —— 机器字段与人读文字
-    并不是同一份键值序列化（值为 null 的字段在文本里根本不出现），
-    所以旧注释那句"每个字段都出现了"站不住。取舍是：文本形态保持不变、
-    不额外提供 JSON 文本镜像；要机器消费的客户端读 ``structuredContent``。
-    """
+    文本保留引擎专属字段，结构化结果只包含通用字段；不另附 JSON 文本镜像。"""
     lines = [f"Search Engine: {engine}"]
 
     if response is None or not hasattr(response, "raw"):
@@ -673,17 +556,12 @@ def _format_response(engine: str, response: Any, limit: int) -> SearchOutcome:
     if not raw:
         lines.append("No results found.")
         if engine in ("Yandex", "Google", "Bing", "GoogleLens", "Tineye"):
-            # 旧文案断言"常需要 cookies 才能绕过机器人验证"——那是猜的，
-            # 对"本来就没收录"、"上游限流"、"引擎缺签名解密"都是误导
-            # （复核报告第 13 问）。改成排查顺序，不替上游下结论。
+            # 空结果不提供足够证据判断具体失败原因。
             lines.append(
-                "Hint: 没匹配到结果的常见成因有好几种 —— 图太小或太模糊、"
-                "收录该图的站点不在这个引擎的覆盖范围内、上游限流，"
-                "或该引擎确实需要凭据。排查顺序：先看引擎有没有给出明确的失败信息，"
-                "再检查凭据配置（见 README 的 Cookies 章节），"
-                "不要假定一定是机器人验证。"
+                "Hint: 可检查图片质量与索引覆盖，或尝试其他引擎。"
+                "若上游需要凭据，请配置该引擎的 Cookies（见 README）。"
             )
-        # **没结果不是错误**：这是一次成功、且上游没有明确报错的搜索。
+        # 没结果不是错误：这是一次成功、且上游没有明确报错的搜索。
         return SearchOutcome(
             text="\n".join(lines),
             structured=_structured_results(engine, [], limit),
@@ -714,7 +592,7 @@ async def search_image(
     source: str,
     engine: str = "Yandex",
     extra_params_json: Optional[str] = None,
-    limit: int = DEFAULT_LIMIT,
+    limit: StrictInt = DEFAULT_LIMIT,
 ) -> ToolResult:
     """
     Perform a reverse image search.
@@ -739,8 +617,6 @@ async def search_image(
     """
     outcome = await _search_image_logic(source, engine, extra_params_json, limit)
     if outcome.is_error:
-        # 工具执行错误 → 按 MCP 规范用 isError=true 交回给调用方，让它/模型能自我修正。
-        # 用 ToolError 而不是让裸异常冒出去：后者的文本会被加上
-        # 「Error calling tool 'search_image': 」前缀（实测），对模型只是噪音。
+        # 使用 ToolError 返回工具执行错误。
         raise ToolError(outcome.text)
     return ToolResult(content=outcome.text, structured_content=outcome.structured)

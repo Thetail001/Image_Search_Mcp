@@ -1,26 +1,5 @@
 #!/usr/bin/env python3
-"""门禁：部署脚本的单元名/单元路径与线上一致，且失败必须响亮。
-
-== 为什么需要这条门禁 ==
-
-早先脚本里硬编码成 ``image-search``，而线上跑的是 ``image-search-mcp``。后果不是
-"报个错"，而是：重启一个不存在的服务名（什么也没发生），再额外造一个同名的假单元。
-这种错误**在输出里看不出来**（打印的仍然是"更新完成"），只有把真正执行的命令记下来
-对比才能发现。所以这里 stub 掉 systemctl/uv/curl/apt，把 argv 逐条记下来做**精确**
-比对，而不是在输出里找子串 —— 子串比对会把 ``image-search-mcp-wrong`` 也判成通过。
-
-== 旧版本最难看的一点：这条门禁自己会改写仓库里的真脚本 ==
-
-旧实现的反向自检直接在仓库里的 ``image_search_mcp_deploy.sh`` 上改，再在 finally 里
-写回。实测确认它确实动过真文件（内容能还原，但 mtime 变了）：内容恰好一致，所以
-"改坏了没有"这类检查全看不出来。现在**所有变异都在临时副本上做**，
-并且在结尾核对仓库文件的 mtime 与摘要没变过 —— 这条自检本身就是那个 bug 的门禁。
-
-== 每台机器都能跑 ==
-
-不写 ``/etc/systemd/system``：用 ``IMAGE_SEARCH_SYSTEMD_DIR`` 把单元目录指到沙箱
-（脚本里的默认值不变）。用真 systemd 测这条门禁就等于验一次东西就得往真系统里写单元。
-"""
+"""用系统命令替身验证部署脚本；所有文件写入和故障注入均在临时目录内进行。"""
 
 from __future__ import annotations
 
@@ -294,11 +273,7 @@ def scenario_replace_unit(tmp: Path) -> list[str]:
 
 
 def scenario_reconfigure_keeps_unit(tmp: Path) -> list[str]:
-    """配置流程 + 保留单元：单元不写，但 .env 会重写 —— 这一点必须说清楚。
-
-    旧版本先重写 .env、后判定是否保留单元，于是"保留了单元"给了人"什么都没改"的错觉，
-    而旧单元照样读那个被重写过的 .env。
-    """
+    """配置流程 + 保留单元：单元不写，但 .env 会重写 —— 这一点必须说清楚。"""
     box = Sandbox(tmp)
     box.setup(env_text=ENV_BASE, unit_exists=True)
     before_unit = (box.systemd / "image-search-mcp.service").read_text()
@@ -319,10 +294,9 @@ def scenario_reconfigure_keeps_unit(tmp: Path) -> list[str]:
         problems.append("重写 .env 时把旧式全局 cookies 删了（凭据不该被静默抹掉）")
     if "不覆盖" not in proc.stdout:
         problems.append("没有说明单元被保留（人无从知道改了什么、没改什么）")
-    if "本次配置变更已生效" not in proc.stdout:
+    if "EnvironmentFile" not in proc.stdout:
         problems.append(
-            "保留了单元却没说明 .env 已被改写、且正是该单元运行时会读的文件 —— "
-            "这会让人以为'保留了单元'等于'什么都没改'"
+            "保留单元时应提示核对 EnvironmentFile，不能假定它读取当前目录下的 .env"
         )
     return problems
 

@@ -1,27 +1,4 @@
-"""MCP 服务的 HTTP 入口与认证中间件。
-
-== 与本模块相关的历史缺陷 ==
-
-1. **静默降级**。旧代码在 SSE 应用构造失败时，``except`` 里退回
-   ``mcp.http_app(path="/")`` —— 也就是把 Streamable HTTP 挂到根路径上，
-   而根路径恰好被认证中间件无条件放行。两者叠加的结果：启动期一次失败
-   就能让整个服务在根路径上匿名可用。
-
-2. **根路径豁免不分方法**。``if scope["path"] == "/"`` 直接放行，
-   既不检查方法也不检查是哪条路由；而 ``Route("/")`` 只处理 GET/HEAD，
-   POST 会继续往下面的 MCP 路由匹配。
-
-3. **缺 token 时照常启动**。没有 token 就不加认证中间件，
-   服务以 ``--host 0.0.0.0`` 起来且完全开放，日志里只有一行"启动成功"。
-
-4. **认证细节**：用 ``==`` 比较 token；畸形 Authorization 头
-   （含非法 UTF-8 字节）会在 ``.decode()`` 处抛异常变成 HTTP 500；
-   不校验 Origin；WebSocket 直接穿过中间件掉进 HTTP 专用的处理器
-   （实测抛 ``KeyError: 'method'``，拿不到数据，但表现为服务端错误）。
-
-现在的姿态是**安全默认**：没有有效 token 就拒绝启动；豁免只给一个只读的
-``/healthz``；异常一律变成明确的状态码而不是 500。
-"""
+"""SSE 服务入口、健康检查与 Bearer 认证中间件。"""
 
 from __future__ import annotations
 
@@ -61,17 +38,10 @@ def _parse_origins(raw: str | None) -> frozenset[str]:
 
 
 class AuthMiddleware:
-    """Bearer Token 认证。
+    """校验 Bearer 令牌和浏览器 Origin。
 
-    放行规则（白名单式）：
-
-    - ``lifespan`` 与其它非 http/websocket 的 scope 直接透传
-    - **websocket 明确拒绝**（1008）：不认证不拒绝的话，它会掉进 HTTP 专用的
-      处理器里抛 ``KeyError``，表现为服务端 500 一类的东西
-    - ``GET``/``HEAD`` 的 ``/healthz`` 免认证
-    - 其余一律要求 ``Authorization: Bearer <token>``
-    - 带 ``Origin`` 的请求，Origin 必须在允许列表里（原生客户端不发 Origin，照常放行）
-    """
+    GET/HEAD /healthz 免认证；拒绝 WebSocket 和重复的安全相关请求头。
+    lifespan 等非 HTTP scope 直接传递给应用。"""
 
     def __init__(
         self,
@@ -105,13 +75,7 @@ class AuthMiddleware:
 
         raw_headers = scope.get("headers", [])
 
-        # 重复的安全相关头必须拒绝，不能"挑一个"。
-        #
-        # ASGI 的头是 [(name, value)] 列表，重复是合法的；而 ``dict(...)`` 是
-        # **后者覆盖前者**，于是"哪个值生效"变成头顺序问题。实测（复核报告第 12 问）：
-        # Authorization 有效在前、无效在后 → 401；反过来无效在前、有效在后 → 204 放行。
-        # 代理链上出现重复头时，两端解读不一致正是经典的绕过手法。所以重复即拒，
-        # 与"畸形头回 400"的既有约定一致。
+        # 拒绝重复头，避免代理与应用对同一请求采用不同的认证值。
         duplicated = [
             name
             for name in (b"authorization", b"origin")
@@ -214,25 +178,8 @@ class AuthMiddleware:
 # --------------------------------------------------------------------------
 
 def build_sse_app():
-    """构造 SSE 应用。
-
-    **没有降级分支** —— 构造失败就让它抛出去，由 ``main()`` 终止进程。
-    旧代码在这里 ``except`` 后改用 ``http_app(path="/")``，而根路径是中间件的
-    无条件豁免项，于是"构造失败"变成了"匿名可用"。一个协议替换不该由异常驱动。
-    """
-    if hasattr(mcp, "http_app"):
-        # 显式钉住路径，不吃默认值。
-        #
-        # 这里有个实测出来的坑：对 ``transport="sse"``，``path`` 控制的是
-        # **SSE 端点本身**，而消息端点是固定 `/messages`。所以传
-        # ``path="/messages"`` 会让两者撞在同一个路径上（实测路由变成
-        # ``['/messages', '/messages']``）。正确值是 ``/sse``。
-        #
-        # 更要紧的是 ``path="/"`` 也合法 —— 一旦有人这么写，协议端点就挂到
-        # 根路径上，和中间件里"根路径放行"的老豁免叠加，等于匿名开放。
-        return mcp.http_app(transport="sse", path="/sse")
-    from mcp.server.fastmcp import create_sse_app  # pragma: no cover - 旧版兼容
-    return create_sse_app(mcp, sse_path="/sse", message_path="/messages")
+    """构造 /sse 应用。构造失败时向调用方抛出异常。"""
+    return mcp.http_app(transport="sse", path="/sse")
 
 
 def _install_routes(app, *, version: str) -> None:
@@ -241,7 +188,7 @@ def _install_routes(app, *, version: str) -> None:
     from starlette.routing import Route
 
     async def healthz(request):
-        # 刻意**不**访问任何引擎：真实搜图会烧配额，还会让上游抽风触发本机重启。
+        # 刻意不访问任何引擎：真实搜图会烧配额，还会让上游抽风触发本机重启。
         # 这里只回答"进程活着、应用装起来了"。
         return JSONResponse({
             "status": "ok",
@@ -262,10 +209,7 @@ def _install_routes(app, *, version: str) -> None:
 
 
 def _resolve_token_and_mode(host: str, *, allow_anonymous: bool) -> str | None:
-    """校验启动姿态。返回 token（None 表示显式匿名开发模式）。
-
-    不安全就 ``SystemExit``，**不是**"继续启动但没有任何认证"。
-    """
+    """校验 HTTP 启动配置，返回令牌；回环匿名模式返回 None。"""
     token = (os.environ.get("MCP_AUTH_TOKEN") or "").strip()
 
     if allow_anonymous:

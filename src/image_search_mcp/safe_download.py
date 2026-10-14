@@ -1,39 +1,7 @@
-"""取图下载器：把"服务器替用户去下载一个 URL"这条路径关进笼子。
+"""下载由本机抓取的用户图片。
 
-== 这条路径原来是什么样的 ==
-
-三个已接入引擎会在本地抓图（``ehentai.py:90``、``baidu.py:99``，以及未接入的 lenso）：
-
-    files = {"sfile": await self.download(url)}
-
-而 ``HandOver.download``（``network.py:310-333``）是这样实现的::
-
-    async with ClientManager(self.client, self.proxies, self.headers, self.cookies, ...) as client:
-        resp = await client.get(url, headers=headers)
-        return resp.read()
-
-四个问题叠在一起：
-
-1. **无地址校验** —— 目标可以是 ``http://127.0.0.1:8080/`` 或内网地址。
-2. **整包读进内存** —— ``resp.read()`` 先全部读出来再返回；
-   ``Content-Length`` 大就 OOM，而且**总超时挡不住它**：一个永远慢慢发、
-   总量合法的响应会让连接一直挂着。
-3. **继承引擎凭据** —— 用的是同一个 client，cookie 和代理都会跟着去目标站点。
-4. **自动跟随重定向** —— 那个 client 是 ``follow_redirects=True``，
-   只校验初始 URL 的写法在这条路上没有意义。
-
-== 本模块的取舍 ==
-
-- **只服务本地抓图的那几个引擎。** 其余引擎把 URL 直接交给搜索站点抓
-  （Yandex 首次 URL 搜索应继续由 Yandex 抓图）—— 那是"对端去抓"，不是我们的出站面。
-- **显式拒绝无法安全处理的组合。** 代理会替我们解析域名，本机的 DNS 校验就无法证明
-  代理最终连到哪；所以下载默认**不继承任何代理**，配置了下载代理则拒绝
-  （见 ``proxy`` 参数）。
-- **DNS 固定连接。** 解析→校验→**用校验过的那个 IP 连接**，同时保留正确的 Host、
-  TLS SNI 与证书校验（``extensions={"sni_hostname": ...}``，httpcore 1.0.9 支持）。
-  只做"解析一下确认是公网，然后普通 get(url)"是不够的 —— 那会二次解析，可被 DNS 重绑定穿过。
-- **每跳重新校验。** 不自动跟随重定向，自己走跳数，逐跳重跑 URL 与地址校验。
-"""
+拒绝非公网地址；连接固定到已校验的 IP，同时保留原主机的 Host 与 TLS SNI。
+逐跳校验重定向，限制响应大小与总时间，不使用代理或引擎凭据。"""
 
 from __future__ import annotations
 
@@ -48,7 +16,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 #: 域名解析器：``(host, port) -> 地址字符串列表``。可注入，便于测试观察
-#: **连接层实际收到的目的地址**（只断言 URL 字符串是测不到 DNS 这一步的）。
+#: 连接层实际收到的目的地址（只断言 URL 字符串是测不到 DNS 这一步的）。
 Resolver = Callable[[str, int], Awaitable[list[str]]]
 
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -109,13 +77,7 @@ def _unwrap_ipv4_mapped(addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | 
     return None
 
 
-#: stdlib 的 flag 表**没盖住**的特殊用途网段，必须显式判否。
-#: 为什么不能只信 ``is_global``：``fec0::/10``（已废弃的 IPv6 站点本地）在本机
-#: Python 3.11.16 上 ``is_global=True``，且 private / reserved 全为 False ——
-#: 所有 flag 都不拦，段首、段内、段尾实测全部放行。
-#: 本项目只要求 Python >=3.10，而这张表在小版本之间会变；安全判定不该跟着
-#: 解释器版本漂移，所以关键的拒绝在这里写死（`is_site_local` 与本表等价，
-#: 选显式网段是为了不依赖 flag 语义，也方便继续加同类的段）。
+#: 显式拒绝 stdlib 地址标志在不同 Python 版本中可能漏判的特殊网段。
 _EXTRA_DENIED_NETWORKS: tuple[
     ipaddress.IPv4Network | ipaddress.IPv6Network, ...
 ] = (
@@ -125,12 +87,7 @@ _EXTRA_DENIED_NETWORKS: tuple[
 
 
 def is_public_address(raw: str) -> bool:
-    """该地址是否可安全访问。
-
-    拒绝：私网、回环、链路本地、多播、保留、未指定、IPv4 映射/6to4 包装的私网地址，
-    以及 :data:`_EXTRA_DENIED_NETWORKS` 里那些 stdlib flag 盖不住的特殊用途网段。
-    允许：公网 IPv4 与公网 IPv6（**不能把"覆盖 IPv6"实现成"一律拒绝 IPv6"**）。
-    """
+    """判断地址是否为可访问的公网 IPv4 或 IPv6。映射地址按其 IPv4 地址检查。"""
     try:
         addr = ipaddress.ip_address(raw.split("%")[0])  # 去 zone id
     except ValueError:
@@ -172,10 +129,7 @@ class Target:
 
     @property
     def _authority(self) -> str:
-        """authority 段。**IPv6 字面量必须带方括号** —— 否则 ``host:port`` 会被
-        重新解析成别的东西（旧实现把 ``2606:4700::1111:8443`` 当主机名发了出去，
-        于是在重定向的下一跳重新 parse 时直接坏掉）。
-        """
+        """生成 URL authority；IPv6 字面量保留方括号。"""
         host = f"[{self.host}]" if ":" in self.host else self.host
         default = 443 if self.scheme == "https" else 80
         return host if self.port == default else f"{host}:{self.port}"
@@ -190,12 +144,7 @@ class Target:
 
 
 def parse_target(url: str, policy: DownloadPolicy) -> Target:
-    """解析并规范化 URL。
-
-    ``urlsplit`` 与 ``.port`` **自己就会抛 ValueError**（非法端口、方括号不配对等）。
-    这里统一包装成 ``invalid_url``：否则调用方看到的是一条裸 ``ValueError``，
-    分不清"用户给了坏 URL"与"服务端出错了"（复核报告 B1 逐个实测了这一串）。
-    """
+    """解析并规范化 URL，将无效协议、主机和端口归为 invalid_url。"""
     if not isinstance(url, str) or not url.strip():
         raise DownloadError("invalid_url", "URL 为空", url=str(url))
 
@@ -226,7 +175,7 @@ def parse_target(url: str, policy: DownloadPolicy) -> Target:
         raise DownloadError("invalid_url", f"端口 {port} 非法", url=url)
 
     # 非 ASCII 主机名先转 IDNA。不转的话它会被原样放进 Host 头，
-    # 直到构造请求时才抛出 UnicodeEncodeError（复核报告 B1 实测「例子.测试」）。
+    # 直到构造请求时才抛出 UnicodeEncodeError。
     bare_host = hostname.rstrip(".")
     try:
         ipaddress.ip_address(bare_host.split("%")[0])  # 字面量地址：原样保留
@@ -270,13 +219,7 @@ async def resolve_and_validate(
     policy: DownloadPolicy,
     resolver: Resolver,
 ) -> list[str]:
-    """解析并校验，返回可用的地址列表（顺序即尝试顺序）。
-
-    策略：**只要解析结果里有任何一个非公网地址，整体拒绝。**
-    攻击者可以用一条公网记录 + 一条内网记录（多 A 记录）来试运气，
-    "挑公网的那个连"看起来更宽容，但一旦将来有人改了选地址逻辑就会破防；
-    宁可整体拒绝，行为更好推理。
-    """
+    """解析目标地址；任意一条结果为非公网地址时拒绝整个请求。"""
     # 字面量地址不需要解析
     try:
         ipaddress.ip_address(target.host.split("%")[0])
@@ -321,12 +264,7 @@ def _pinned_url(target: Target, address: str) -> str:
 # --------------------------------------------------------------------------
 
 class SafeDownloader:
-    """带地址校验、跳数控制、字节预算与总期限的下载器。
-
-    明确**不继承**环境代理与引擎凭据：
-    ``trust_env=False`` 且默认 ``proxy=None``。原因是这两样都会让上面的地址校验失去意义 ——
-    代理替你解析域名，凭据则把引擎身份带给了目标站点。
-    """
+    """具备地址校验、重定向控制、体积限制和总期限的图片下载器。"""
 
     def __init__(
         self,
@@ -350,19 +288,9 @@ class SafeDownloader:
         self._proxy = None
 
     async def fetch(self, url: str) -> bytes:
-        """取回图片字节。
+        """在总期限内下载图片，覆盖 DNS、连接、重定向和读取。
 
-        **整条调用受一个绝对期限约束**：DNS 解析、每一跳的连接与响应头、读取循环、
-        以及失败后的清理，都必须在 ``policy.total_timeout`` 内结束。
-
-        之前这里只把 deadline 的**数值**往下传、在"每跳开始"和"收到 body chunk"处比较
-        —— 那盖不住裸 await：resolver 卡住时协程会一直挂着，下载器自己不报 timeout
-        （实测：30 ms 期限配一个阻塞的 resolver，只有外层 ``wait_for`` 能停住它）。
-        所以在外层再包一层 ``wait_for`` —— 这是唯一能把"正在等待的裸 await"
-        也纳入期限的办法。
-
-        不用 ``asyncio.timeout``：那是 3.11+ 才有的，而 pyproject 声明支持 3.10。
-        """
+        asyncio.wait_for 可在 Python 3.10 上使用，并能取消阻塞的 await。"""
         budget = self.policy.total_timeout
         try:
             return await asyncio.wait_for(self._fetch_hops(url, budget), budget)
@@ -380,8 +308,8 @@ class SafeDownloader:
                 raise DownloadError("timeout", "下载总期限已到", url=current)
 
             target = parse_target(current, self.policy)
-            # 把**当前**这一跳记进 visited。不记的话，一个指回起点的重定向
-            # 要等到再发一次请求之后才被发现（复核报告 B1）。
+            # 把当前这一跳记进 visited。不记的话，一个指回起点的重定向
+            # 要等到再发一次请求之后才被发现。
             if target.display not in visited:
                 visited.append(target.display)
             addresses = await resolve_and_validate(target, self.policy, self._resolver)
@@ -392,7 +320,7 @@ class SafeDownloader:
 
             if response_status in REDIRECT_STATUSES:
                 # 缺 Location、成环要先判：放在跳数之后的话，在最后一跳
-                # 这些更具体的原因会被 too_many_redirects 盖住（复核报告 B1）
+                # 这些更具体的原因会被 too_many_redirects 盖住
                 if not location:
                     raise DownloadError("redirect_without_location", "重定向缺少 Location", url=current)
 
@@ -432,10 +360,7 @@ class SafeDownloader:
         addresses: list[str],
         deadline: float,
     ) -> tuple[int, str | None, bytes]:
-        """对一个已校验的目标发一次请求（不跟随重定向）。
-
-        会依次尝试解析出的各个地址；全部失败才报错。
-        """
+        """依次尝试已校验的地址，不自动跟随重定向。"""
         last_error: Exception | None = None
         timed_out = False
 
@@ -446,7 +371,7 @@ class SafeDownloader:
                 raise
             except httpx.TimeoutException as exc:
                 # 单次 I/O 超时与"连不上"对排查的含义完全不同：
-                # 过去 ReadTimeout 也被归成 connection_failed（复核报告 B1）
+                # 过去 ReadTimeout 也被归成 connection_failed
                 last_error = exc
                 timed_out = True
                 continue
@@ -454,7 +379,7 @@ class SafeDownloader:
                 last_error = exc
                 continue
 
-        # 只报异常**类型名**，不把 str(exc) 拼进来：它可能带目标 URL 或本地细节
+        # 只报异常类型名，不把 str(exc) 拼进来：它可能带目标 URL 或本地细节
         raise DownloadError(
             "timeout" if timed_out else "connection_failed",
             f"无法连接 {target.host}（尝试 {addresses}）："
@@ -468,13 +393,13 @@ class SafeDownloader:
         address: str,
         deadline: float,
     ) -> tuple[int, str | None, bytes]:
-        # 连到**已校验的那个 IP**；Host 与 TLS SNI 仍用原主机名，证书按原主机名校验
+        # 连到已校验的那个 IP；Host 与 TLS SNI 仍用原主机名，证书按原主机名校验
         pinned = _pinned_url(target, address)
         headers = {
             "Host": target.host_header,
             "User-Agent": self.policy.user_agent,
             "Accept": "*/*",
-            # 明确要**未压缩**的字节。图片本身已是压缩格式，再叠一层内容编码
+            # 明确要未压缩的字节。图片本身已是压缩格式，再叠一层内容编码
             # 只会把"先解压再计数"变成一条内存放大路径（见 _read_bounded 的说明）。
             "Accept-Encoding": "identity",
         }
@@ -505,14 +430,12 @@ class SafeDownloader:
                     return status, response.headers.get("location"), b""
 
                 if status >= 400:
-                    # 在**读 body 之前**判定。先读完再报的话，一个大 body 的错误页
-                    # 会被归成 too_large（复核报告 B1 实测：503 带超限 Content-Length
-                    # 报的是 too_large 而不是 http_error），而且白下载一遍。
+                    # 先处理 HTTP 错误，避免下载错误页面的 body。
                     raise DownloadError(
                         "http_error", f"目标返回 HTTP {status}", url=target.display
                     )
 
-                # Content-Length 只用来提前拒绝，**不能代替**实际计数：
+                # Content-Length 只用来提前拒绝，不能代替实际计数：
                 # 分块响应、以及谎报长度的响应都必须靠流式累计来兜住
                 declared = response.headers.get("content-length")
                 if declared is not None:
@@ -528,13 +451,7 @@ class SafeDownloader:
 
                 encoding = (response.headers.get("content-encoding") or "").strip().lower()
                 if encoding and encoding != "identity":
-                    # 光发 ``Accept-Encoding: identity`` 不够 —— 服务端可以不遵守。
-                    # 一旦是 gzip/deflate，httpx 会在 yield 出第一个 chunk **之前**就把
-                    # 整个 body 解出来（``_models.py`` 是先 decode 再 yield，而
-                    # ``_decoders.py`` 的 gzip 解压没有输出长度上限）。
-                    # 实测：32 MiB 数据压成 32 KB，预算设 1 MiB —— 最终确实报 too_large，
-                    # 但此前 Python 分配峰值已到 77.41 MiB，防护发生得太晚。
-                    # 所以在读之前就拒掉，并把原因说清楚，便于排查是站点行为还是配置问题。
+                    # 在读取前拒绝压缩响应：httpx 的解压先于流式计数，可能放大内存占用。
                     raise DownloadError(
                         "unsupported_content_encoding",
                         f"目标以 Content-Encoding: {encoding} 压缩响应，"
@@ -554,21 +471,10 @@ class SafeDownloader:
         target: Target,
         deadline: float,
     ) -> bytes:
-        """流式读取：大小上限**和**期限都在这里自己查。
+        """流式累计响应字节数，并在每个数据块到达时检查总期限。
 
-        **两层都要留**，这是实测结论（我先前删过内层，被复核用实测驳回了）：
-        外层 ``wait_for`` 是唯一能停住"正在等的裸 await"（例如卡在 resolver 线程里）
-        的手段，但它投递取消只能落在 await 点上 —— 20 ms 期限配一个忙转的流，
-        实测跑到了 135 ms。内层这个检查不依赖取消，每收到一个 chunk 比一次绝对期限，
-        负责把"数据还在稳定到达、但总时限已经过了"当场截停。
-        反过来只留内层也不行：卡在裸 await 上时根本轮不到它。
-
-        - **计的是解码后的字节数**（``aiter_bytes``）。但这**不等于内存受控** ——
-          httpx 先把 raw 解压、再 yield 出来，解压发生在本函数的计数**之前**，
-          所以"已经分配过一大块之后才报超限"是可能的。
-          真正的防线在 ``_request_pinned``：读之前就拒绝非 identity 的
-          ``Content-Encoding``。
-        """
+        外层 wait_for 处理阻塞等待；循环内检查处理持续产出但不让出执行权的流。
+        非 identity 内容编码已在读取前拒绝，避免先解压后计数造成内存放大。"""
         chunks: list[bytes] = []
         total = 0
         async for chunk in response.aiter_bytes():
@@ -586,7 +492,5 @@ class SafeDownloader:
         return b"".join(chunks)
 
 
-#: 会在**本地**抓图的引擎 —— 也就是说，用户给的 URL 会由我们的服务器去访问。
-#: 其余引擎把 URL 交给搜索站点自己去抓，那不是本机的出站面。
-#: 这个集合由 ``tests/test_safe_download.py`` 对着上游源码核验（谁调用 ``self.download``）。
+#: 使用本机安全下载器的引擎；该集合由上游源码检查验证。
 ENGINES_THAT_FETCH_LOCALLY: frozenset[str] = frozenset({"EHentai", "BaiDu"})

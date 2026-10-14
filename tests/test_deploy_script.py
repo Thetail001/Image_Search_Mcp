@@ -67,3 +67,17 @@ def test_unit_creation_treats_directory_names_as_data(tmp_path):
     unit = (box.systemd / "image-search-mcp.service").read_text()
     assert f'EnvironmentFile="{box.work}/.env"' in unit
     assert "sudo\tbash" not in records
+
+
+@pytest.mark.parametrize("configured,entered,expected", [("TraceMoe", "", "TraceMoe"), ("Yandex", "all", "All")])
+def test_reconfiguration_preserves_or_changes_default_engine(tmp_path, configured, entered, expected):
+    box = Sandbox(tmp_path)
+    box.setup(
+        env_text=f"PORT=8000\nMCP_AUTH_TOKEN=example-token-123456\nIMAGE_SEARCH_DEFAULT_ENGINE={configured}\n",
+        unit_exists=True,
+    )
+    proc, _ = box.run(["--reconfigure"], stdin="\n" * 5 + entered + "\n")
+    assert proc.returncode == 0, proc.stderr
+    contents = (box.work / ".env").read_text()
+    assert f"IMAGE_SEARCH_DEFAULT_ENGINE={expected}\n" in contents
+    assert contents.count("IMAGE_SEARCH_DEFAULT_ENGINE=") == 1

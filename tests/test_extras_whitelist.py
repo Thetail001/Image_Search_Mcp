@@ -12,7 +12,7 @@ from image_search_mcp import params, server
 IMAGE_URL = "https://example.com/a.jpg"
 
 #: 一个不可能真实存在的路径，用来当哨兵
-CANARY_PATH = "/tmp/asa-canary-not-a-real-secret.txt"
+CANARY_PATH = "/tmp/image-search-canary-not-a-real-secret.txt"
 CANARY_CONTENT = b"CANARY-CONTENT-7f3a91b2-should-never-leave-the-host"
 
 #: ``_search_image_logic`` 现在返回 ``SearchOutcome``（文本 + 结构 + is_error）。
@@ -112,7 +112,7 @@ async def test_input_is_applied_after_extras_so_it_cannot_be_overridden(monkeypa
 
     monkeypatch.setattr(server, "ENGINES", {"TraceMoe": FakeTraceMoe})
     result = await server._search_image_logic(
-        IMAGE_URL, "TraceMoe", '{"file": "/tmp/asa-canary-not-a-real-secret.txt"}', 1,
+        IMAGE_URL, "TraceMoe", '{"file": "/tmp/image-search-canary-not-a-real-secret.txt"}', 1,
     )
 
     assert not result.is_error

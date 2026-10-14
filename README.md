@@ -229,7 +229,7 @@ All 模式还返回 `engine_outcomes`，记录每个引擎的 `success`、`no_re
 
 ```json
 {
-  "path": "/srv/image-search/inbox/123456_7890_photo.jpg",
+  "path": "/srv/image-search/inbox/photo.jpg",
   "engine": "Yandex",
   "limit": 5
 }

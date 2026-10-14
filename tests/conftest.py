@@ -1,16 +1,4 @@
-"""测试夹具。
-
-== 两条默认姿态 ==
-
-1. **清空环境变量**：本服务的配置全从 ``IMAGE_SEARCH_*`` 读。开发机或 CI 上残留一个
-   变量就会让测试行为漂移（实测过：非空 cookie 会把整条搜索路径带到另一条分支上）。
-   每个测试开始前把这些变量清掉，需要时由测试自己设。
-
-2. **默认禁网**：没有显式注册 handler 的测试**不允许发出真实 HTTP 请求**。
-   这里给 ``httpx`` 注入一个"拒绝一切"的 transport；测试要模拟网络就通过
-   ``mock_http`` 注册 handler。这样"忘记 mock"会立刻报错，而不是去访问真实站点 ——
-   后者会让测试慢、不稳定，还可能触发对端风控。
-"""
+"""测试夹具：清理配置环境变量，默认拦截真实 HTTP 与 DNS 请求。"""
 
 from __future__ import annotations
 
@@ -100,13 +88,7 @@ def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 
 def _capture_real_getaddrinfo() -> Callable[..., Any]:
-    """在**模块加载时**抓下真实的 ``socket.getaddrinfo``。
-
-    不能等到夹具里现读：``_no_real_dns`` 是 autouse，跑到 ``allow_real_dns`` 时
-    ``socket.getaddrinfo`` 早已是拦截器，现读就是"把拦截器当真函数再装回去"——
-    于是"放行真实 DNS"从来没有真正放行过
-    （复核报告第 12 问实测 ``allow_real_dns_restored_original False``）。
-    """
+    """在模块加载时抓下真实的 ``socket.getaddrinfo``。"""
     import socket
 
     return socket.getaddrinfo
@@ -149,20 +131,7 @@ def allow_real_dns(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 def real_client_init(monkeypatch: pytest.MonkeyPatch):
-    """临时恢复真实的 ``httpx.AsyncClient.__init__``（不做 transport 注入）。
-
-    为什么必须有这个开口：``_no_real_network`` 会给每个 client 注入
-    ``MockTransport``，而 httpx 里算的是
-
-        allow_env_proxies = trust_env and transport is None
-
-    —— 一旦传了 transport，它**根本不去读环境代理**。于是"环境代理会不会被采用"
-    这类行为在默认夹具下永远测不到：把实现改回 ``trust_env=True`` 测试照样全绿
-    （复核报告 B6 那条假测试，根因就在这里，不在测试写法上）。
-
-    用它时注意：这个 client 走真实 transport，出站会真的发出去。
-    只构造、不发送是安全的（仓库里用它来观察 ``_mounts``）。
-    """
+    """临时恢复真实的 ``httpx.AsyncClient.__init__``（不做 transport 注入）。"""
     monkeypatch.setattr(httpx.AsyncClient, "__init__", _real_async_init)
     yield
 

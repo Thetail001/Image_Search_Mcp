@@ -1,32 +1,14 @@
 #!/bin/bash
+# 使用 uv 和 systemd 部署或更新 Image Search MCP。
 #
-# Image Search MCP Server 部署脚本（UV 引擎版）
+# --update-only：升级工具并重启现有单元，不修改配置。
+# --reconfigure：备份并重写 .env，保留非托管键。
+# --replace-unit：重新配置，同时备份并替换 systemd 单元。
 #
-# == 三个模式 ==
-#
-#   （无选项）        已有 .env 时问你；y = 仅升级包并重启（**不动配置**），n = 走配置流程
-#   --reconfigure     直接走配置流程：.env 先备份再重写，非托管键原样保留
-#   --replace-unit    连同 systemd 单元一起替换（隐含配置流程，旧单元先按时间戳备份）
-#
-# 线上那份单元把凭据直接写在单元里（Environment=MCP_AUTH_TOKEN=...），而本脚本
-# 写的是 EnvironmentFile=.env —— 覆盖一下凭据就没了、服务起不来。所以**已有单元
-# 默认不覆盖**，要替换必须显式 --replace-unit。
-#
-# == 为什么先探测、后动手 ==
-#
-# 早先的版本先重写 .env（在"是否保留单元"的判定之前），于是"保留了单元"并不等于
-# "保留了运行配置"：旧单元照样读那个被重写过的 .env，各引擎的 cookies（scoped
-# 变量）在重写时被整段丢掉。现在把单元探测与模式决定放在**任何写入之前**，
-# 重写 .env 时保留所有非托管键，并且先备份。
-#
-# == 失败必须响亮 ==
-#
-# 旧版本用 `echo "服务状态: $(systemctl is-active ...)"` —— 命令替换的非零状态被
-# echo 的成功掩盖，服务没起来照样打印"更新完成"。现在显式检查退出码，并且做两件
-# 真事：查 /healthz，以及一次**带凭据的**请求（/healthz 免鉴权，只查它证明不了
-# 凭据装对了）。
+# 默认保留现有单元；启动后检查服务状态、健康端点和可用的认证令牌。
 
 set -uo pipefail
+umask 077
 
 ENV_PATH="$(pwd)/.env"
 
@@ -49,11 +31,10 @@ UV_BIN=$(find_uv)
 
 fail() { echo "错误: $*" >&2; exit 1; }
 
-# 值里有空白/引号/行首 # 时必须引起来：.env 既被本脚本 source，又被 systemd 的
-# EnvironmentFile 读；cookies 里带空格是常态（`sid=xx; other=yy`），不引会被拆词、
-# 或者只拿到一半。
+# 写成 systemd EnvironmentFile 支持的单行值。
 env_quote() {
     local value="$1"
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
     case "$value" in
         *[[:space:]]*|*['"'\''\\$`#']*)
             value="${value//\\/\\\\}"
@@ -64,15 +45,60 @@ env_quote() {
     esac
 }
 
+# 只读取部署脚本所需的键；不执行 .env 中的变量展开或命令替换。
+# 支持单行未引用值、单引号值和双引号值。多行值需要人工调整。
+load_env() {
+    local line key value first char next decoded i line_number=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_number += 1))
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        case "$key" in
+            HOST|PORT|MCP_AUTH_TOKEN|IMAGE_SEARCH_API_KEY|IMAGE_SEARCH_PROXY) ;;
+            *) continue ;;
+        esac
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        first="${value:0:1}"
+        if [[ "$first" == "'" || "$first" == '"' ]]; then
+            [[ ${#value} -ge 2 && "${value: -1}" == "$first" ]] \
+                || fail ".env 第 ${line_number} 行的引号未闭合；仅支持单行值"
+            value="${value:1:${#value}-2}"
+        fi
+        decoded=""
+        for ((i = 0; i < ${#value}; i++)); do
+            char="${value:i:1}"
+            if [[ "$char" == "$first" && ( "$first" == "'" || "$first" == '"' ) ]]; then
+                fail ".env 第 ${line_number} 行含未转义的引号"
+            fi
+            if [[ "$char" == '\' && "$first" != "'" ]]; then
+                ((i += 1))
+                [[ $i -lt ${#value} ]] || fail ".env 第 ${line_number} 行含不完整的转义"
+                next="${value:i:1}"
+                if [[ "$first" == '"' ]]; then
+                    case "$next" in
+                        '\'|'"'|'$'|'`') char="$next" ;;
+                        *) char="\$next" ;;
+                    esac
+                else
+                    char="$next"
+                fi
+            fi
+            decoded+="$char"
+        done
+        printf -v "$key" '%s' "$decoded"
+    done < "$ENV_PATH"
+}
+
 # ---------------------------------------------------------------------------
-# 服务单元名：**单一事实来源**
+# 部署与更新使用同一个可配置单元名。
 #
-# 早先这里硬编码成 `image-search`，而线上跑的是 `image-search-mcp` —— 实测确认：
-# 照旧脚本跑既不会重启到真正在跑的服务，还会额外造一个同名的假单元。
 # ---------------------------------------------------------------------------
 
 UNIT_NAME="${IMAGE_SEARCH_UNIT:-image-search-mcp}"
-# 单元目录留一个覆盖点（默认值不变）：门禁要在**不碰真 /etc/systemd** 的前提下跑完整条
+# 单元目录留一个覆盖点（默认值不变）：门禁要在不碰真 /etc/systemd 的前提下跑完整条
 # 配置流程 —— 否则验这条门禁就得往真系统里写单元文件，那比脚本自身的 bug 更糟。
 SYSTEMD_DIR="${IMAGE_SEARCH_SYSTEMD_DIR:-/etc/systemd/system}"
 UNIT_PATH="${SYSTEMD_DIR}/${UNIT_NAME}.service"
@@ -93,7 +119,7 @@ usage() {
   IMAGE_SEARCH_UNIT=<名字>      覆盖单元名（默认 image-search-mcp）
   IMAGE_SEARCH_SYSTEMD_DIR=...  覆盖单元目录（默认 /etc/systemd/system；主要给门禁用）
 
-注意: 已有单元默认**不覆盖** —— 线上那份把凭据写在单元里，覆盖会弄丢凭据。
+注意: 已有单元默认不覆盖 —— 线上那份把凭据写在单元里，覆盖会弄丢凭据。
 USAGE
 }
 
@@ -107,11 +133,8 @@ for arg in "$@"; do
     esac
 done
 
-# --- 启动后的校验：状态、健康、凭据 ----------------------------------------
+# 分别检查进程状态、HTTP 健康和认证令牌。
 #
-# 三个都查，是因为它们证的东西不同：
-#   is-active 证"进程起来了"；/healthz 证"HTTP 层活着"（它免鉴权）；
-#   带凭据请求证"凭据装对了" —— 前两个都过了而凭据是错的，服务照样没法用。
 verify_service() {
     # 显式查退出码。旧版本把这句塞进 $( )，非零状态被 echo 本身的状态掩盖。
     if ! sudo systemctl is-active --quiet "${UNIT_NAME}"; then
@@ -149,9 +172,8 @@ verify_service() {
     case "$code" in
         401) echo "错误: 带凭据请求仍返回 401 —— 凭据没装对" >&2; return 1 ;;
         400) echo "鉴权冒烟: 凭据被接受（400 = 缺 session_id，符合预期）" ;;
-        404|405) echo "警告: /messages/ 返回 ${code}，端点形状与预期不同 —— 本次**没有**验证鉴权" >&2 ;;
         000|'') echo "错误: 带凭据请求无响应" >&2; return 1 ;;
-        *) echo "警告: 鉴权冒烟返回 ${code}，请人工确认" >&2 ;;
+        *) echo "错误: 鉴权检查返回 ${code}（期望 400），无法确认凭据有效" >&2; return 1 ;;
     esac
     return 0
 }
@@ -172,9 +194,7 @@ UNIT_EXISTS=0
 if sudo test -f "${UNIT_PATH}"; then
     UNIT_EXISTS=1
     echo "已存在单元: ${UNIT_PATH}"
-    # 线上真正运行的启动方式可能与本脚本写的不同（线上是 start.sh 里的 uvx，
-    # 本脚本写的是 `uv tool run`）。从"重启对了单元名"推不出"跑的是刚升级的版本"，
-    # 所以把线上真实的 ExecStart 摆出来，让人自己看。
+    # 显示现有 ExecStart，便于核对升级工具是否为服务实际使用的入口。
     LIVE_EXEC=$(sudo systemctl cat "${UNIT_NAME}" 2>/dev/null | grep -m1 '^ExecStart=' || true)
     [ -n "$LIVE_EXEC" ] && echo "线上启动方式: ${LIVE_EXEC}"
 else
@@ -182,7 +202,7 @@ else
 fi
 
 if [ "$UNIT_EXISTS" = "1" ] && [ "$REPLACE_UNIT" != "1" ]; then
-    echo "单元将被**保留**（要替换就加 --replace-unit，会先备份）。"
+    echo "单元将被保留（要替换就加 --replace-unit，会先备份）。"
 fi
 
 # ---------------------------------------------------------------------------
@@ -191,7 +211,7 @@ fi
 
 if [ -z "$MODE" ]; then
     if [ -f "$ENV_PATH" ] && [ -n "$UV_BIN" ]; then
-        read -p "是否仅升级服务代码并重启?（y=只升级，不动配置；n=走配置流程）(y/n, 默认 y): " IS_UPDATE
+        read -r -p "是否仅升级服务代码并重启?（y=只升级，不动配置；n=走配置流程）(y/n, 默认 y): " IS_UPDATE
         IS_UPDATE=${IS_UPDATE:-y}
         if [ "$IS_UPDATE" = "y" ]; then MODE="update"; else MODE="reconfigure"; fi
     else
@@ -212,7 +232,7 @@ fi
 if [ "$MODE" = "update" ]; then
     [ -n "$UV_BIN" ] || fail "找不到 uv 命令，无法升级"
     # 只为读端口/凭据做校验，不写回。
-    [ -f "$ENV_PATH" ] && { source "$ENV_PATH" || true; }
+    [ -f "$ENV_PATH" ] && load_env
 
     echo -e "\n[1/3] 正在升级 image-search-mcp..."
     if ! "$UV_BIN" tool upgrade image-search-mcp; then
@@ -221,7 +241,7 @@ if [ "$MODE" = "update" ]; then
             || fail "uv tool upgrade/install 都失败了"
     fi
 
-    # 只升级代码并重启**已存在的**单元：不替你猜单元名。
+    # 只升级代码并重启已存在的单元：不替你猜单元名。
     if ! sudo systemctl cat "${UNIT_NAME}" >/dev/null 2>&1; then
         fail "找不到服务单元 ${UNIT_NAME}。线上实际用的是 image-search-mcp.service；若目标机器上叫别的名字，用 IMAGE_SEARCH_UNIT=<名字> 覆盖。"
     fi
@@ -253,11 +273,10 @@ if [ -f "$ENV_PATH" ]; then
     ENV_BACKUP="${ENV_PATH}.bak.$(date +%Y%m%d%H%M%S)"
     cp -a "$ENV_PATH" "$ENV_BACKUP" || fail "备份 ${ENV_PATH} 失败"
     echo "已备份原配置 → ${ENV_BACKUP}"
-    # shellcheck disable=SC1090
-    source "$ENV_PATH" || true
+    load_env
 fi
 
-read -p "请输入服务监听端口 (当前: ${PORT:-8000}): " NEW_PORT
+read -r -p "请输入服务监听端口 (当前: ${PORT:-8000}): " NEW_PORT
 PORT=${NEW_PORT:-${PORT:-8000}}
 case "$PORT" in
     ''|*[!0-9]*) fail "端口必须是数字：${PORT}" ;;
@@ -267,31 +286,28 @@ if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
 fi
 
 echo -e "\n[2/6] 配置环境变量 (直接按回车保留当前值或跳过):"
-read -p "请输入 MCP_AUTH_TOKEN: " NEW_AUTH_TOKEN
+read -r -p "请输入 MCP_AUTH_TOKEN: " NEW_AUTH_TOKEN
 MCP_AUTH_TOKEN=${NEW_AUTH_TOKEN:-${MCP_AUTH_TOKEN:-}}
+[[ -n "${MCP_AUTH_TOKEN//[[:space:]]/}" ]] || fail "MCP_AUTH_TOKEN 不能为空"
 
-read -p "请输入 SauceNAO API Key: " NEW_SAUCE_KEY
+read -r -p "请输入 SauceNAO API Key: " NEW_SAUCE_KEY
 IMAGE_SEARCH_API_KEY=${NEW_SAUCE_KEY:-${IMAGE_SEARCH_API_KEY:-}}
 
-read -p "请输入 HTTP 代理（留空=不修改）: " NEW_PROXY
+read -r -p "请输入 HTTP 代理（留空=不修改）: " NEW_PROXY
 IMAGE_SEARCH_PROXY=${NEW_PROXY:-${IMAGE_SEARCH_PROXY:-}}
 
-# cookies 必须**带归属**。旧版本写的是无归属的 IMAGE_SEARCH_COOKIES，
-# 而凭据契约要求：要么用引擎专属变量 IMAGE_SEARCH_COOKIES_<ENGINE>，
-# 要么用全局变量 + IMAGE_SEARCH_COOKIES_ENGINE 指明归属；无归属的全局值会被拒绝。
+# Cookies 按引擎配置，旧全局变量需要明确归属。
 COOKIE_KEY=""
 COOKIE_VALUE=""
-read -p "Cookies 属于哪个引擎（如 Yandex / Bing；留空=不修改现有 cookies): " NEW_COOKIE_ENGINE
+read -r -p "Cookies 属于哪个引擎（如 Yandex / Bing；留空=不修改现有 cookies): " NEW_COOKIE_ENGINE
 if [ -n "$NEW_COOKIE_ENGINE" ]; then
     COOKIE_KEY="IMAGE_SEARCH_COOKIES_$(printf '%s' "$NEW_COOKIE_ENGINE" | tr '[:lower:]-' '[:upper:]_')"
-    read -p "请输入 ${NEW_COOKIE_ENGINE} 的 Cookies（形如 sid=xxx; other=yyy）: " NEW_COOKIES
+    read -r -p "请输入 ${NEW_COOKIE_ENGINE} 的 Cookies（形如 sid=xxx; other=yyy）: " NEW_COOKIES
     COOKIE_VALUE=${NEW_COOKIES:-}
     [ -z "$COOKIE_VALUE" ] && fail "选了引擎却没给 cookies 值；不想改就留空引擎名"
 fi
 
-# 我们**只管**这几个键；其余一律原样保留 —— 包括旧式的全局 cookies 与它的归属键，
-# 以及用户自己加的键。曾经把 IMAGE_SEARCH_COOKIES(_ENGINE) 也排除在外，结果
-# "重新配置"会静默删掉已配置的 cookies —— 正是"看着保留了单元、其实丢了运行配置"那一类。
+# 只替换脚本管理的键，保留其他配置。
 PRESERVED=""
 if [ -f "$ENV_PATH" ]; then
     PRESERVED=$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_PATH" \
@@ -353,10 +369,9 @@ WRITE_UNIT=1
 if sudo test -f "${UNIT_PATH}"; then
     if [ "$REPLACE_UNIT" != "1" ]; then
         WRITE_UNIT=0
-        echo "已存在 ${UNIT_PATH}，**不覆盖**。"
-        echo "  线上那份把凭据写在单元里（Environment=MCP_AUTH_TOKEN=...），"
-        echo "  而本脚本写的是 EnvironmentFile=.env —— 覆盖会把凭据弄丢，服务就起不来了。"
-        echo "  注意: 上面写入的 .env 正是该单元运行时会读的文件，本次配置变更已生效。"
+        echo "已存在 ${UNIT_PATH}，不覆盖。"
+        echo "  .env 已更新，请核对现有单元的 EnvironmentFile 是否指向 ${ENV_PATH}。"
+        echo "  若凭据写在单元的 Environment 中，需要单独更新该配置。"
         echo "  确实要替换单元就加 --replace-unit（会先按时间戳备份）。"
     else
         UNIT_BACKUP="${UNIT_PATH}.bak.$(date +%Y%m%d%H%M%S)"
@@ -366,17 +381,20 @@ if sudo test -f "${UNIT_PATH}"; then
 fi
 
 if [ "$WRITE_UNIT" = "1" ]; then
-    sudo bash -c "cat << EOF > ${UNIT_PATH}
+    UNIT_TEMP=$(mktemp) || fail "无法创建临时单元文件"
+    trap 'rm -f "$UNIT_TEMP"' EXIT
+    unit_quote() { env_quote "${1//%/%%}"; }
+    cat > "$UNIT_TEMP" <<EOF
 [Unit]
 Description=Image Search MCP Server
 After=network.target
 
 [Service]
 User=$CURRENT_USER
-WorkingDirectory=$CURRENT_DIR
-EnvironmentFile=$ENV_PATH
+WorkingDirectory=$(unit_quote "$CURRENT_DIR")
+EnvironmentFile=$(unit_quote "$ENV_PATH")
 # 使用 uv 运行托管的工具，并强制指定 Python 3.12
-ExecStart=$UV_BIN tool run --python 3.12 image-search-mcp --sse --host 0.0.0.0 --port ${PORT}
+ExecStart=$(unit_quote "$UV_BIN") tool run --python 3.12 image-search-mcp --sse --host 0.0.0.0 --port ${PORT}
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -384,7 +402,8 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-EOF" || fail "写单元文件失败"
+EOF
+    sudo install -m 644 "$UNIT_TEMP" "$UNIT_PATH" || fail "写单元文件失败"
 fi
 
 # ---- 启动与校验 ----

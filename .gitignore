@@ -36,12 +36,8 @@ htmlcov/
 coverage.xml
 report.xml
 
-# Local settings/testing
+# 根目录下的临时测试脚本；不忽略 tests/ 中的同名文件。
 #
-# 这几条以前没有开头的斜杠，于是会匹配**任何目录下**的同名文件：
-# 将来往 tests/ 里放一个 tests/test_logic.py，它会被静默忽略、永远提交不上，
-# 而本地跑起来一切正常 —— "只在本机存在"的测试是最难查的一类问题。
-# 锚定到仓库根之后，它们只匹配根目录下那几个历史遗留脚本。
 .env
 /quick_test.py
 /test_logic.py

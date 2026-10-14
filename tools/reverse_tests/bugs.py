@@ -1,14 +1,4 @@
-"""反向测试用的"故障注入"定义。
-
-每一条把**已经被修掉的缺陷重新放回代码里**，然后指定一个应当因此变红的测试。
-判定标准只有两条，缺一不可：
-
-1. 被注入的模块确实是临时副本里的那一份（否则跑的还是干净代码，反向测试是假的）
-2. 指定的那条测试确实红了
-
-只跑"能过"的测试不叫门禁 —— 一条永远绿的门禁和没有门禁一样，甚至更糟：
-它让人以为有人在看着。所以这里的每一条都必须先证明门禁会红。
-"""
+"""反向测试的故障注入定义，包含源码替换片段和对应回归测试。"""
 
 from __future__ import annotations
 
@@ -139,8 +129,8 @@ INJECTIONS: tuple[BugInjection, ...] = (
     BugInjection(
         name="sse-mounted-at-root",
         path="src/image_search_mcp/main.py",
-        old='        return mcp.http_app(transport="sse", path="/sse")',
-        new='        return mcp.http_app(transport="sse", path="/")',
+        old='    return mcp.http_app(transport="sse", path="/sse")',
+        new='    return mcp.http_app(transport="sse", path="/")',
         test="tests/test_auth_asgi.py::test_protocol_endpoint_is_not_mounted_at_root",
         why="静默降级：协议端点挂到根路径，和根路径豁免叠加就是匿名可用",
     ),
@@ -317,14 +307,14 @@ INJECTIONS: tuple[BugInjection, ...] = (
         name="http-status-check-after-size-budget",
         path="src/image_search_mcp/safe_download.py",
         old=(
-            "                if status >= 400:\n"
-            "                    # 在**读 body 之前**判定。先读完再报的话，一个大 body 的错误页\n"
-            "                    # 会被归成 too_large（复核报告 B1 实测：503 带超限 Content-Length\n"
-            "                    # 报的是 too_large 而不是 http_error），而且白下载一遍。\n"
-            "                    raise DownloadError(\n"
+            (
+            '                if status >= 400:\n'
+            '                    # 先处理 HTTP 错误，避免下载错误页面的 body。\n'
+            '                    raise DownloadError(\n'
             '                        "http_error", f"目标返回 HTTP {status}", url=target.display\n'
-            "                    )\n"
-            "\n"
+            '                    )\n'
+            '\n'
+        )
         ),
         new="",
         test=(
@@ -337,12 +327,14 @@ INJECTIONS: tuple[BugInjection, ...] = (
         name="read-timeout-lumped-into-connection-failed",
         path="src/image_search_mcp/safe_download.py",
         old=(
-            "            except httpx.TimeoutException as exc:\n"
+            (
+            '            except httpx.TimeoutException as exc:\n'
             '                # 单次 I/O 超时与"连不上"对排查的含义完全不同：\n'
-            "                # 过去 ReadTimeout 也被归成 connection_failed（复核报告 B1）\n"
-            "                last_error = exc\n"
-            "                timed_out = True\n"
-            "                continue\n"
+            '                # 过去 ReadTimeout 也被归成 connection_failed\n'
+            '                last_error = exc\n'
+            '                timed_out = True\n'
+            '                continue\n'
+        )
         ),
         new="",
         test=(
@@ -355,11 +347,13 @@ INJECTIONS: tuple[BugInjection, ...] = (
         name="initial-url-not-marked-visited",
         path="src/image_search_mcp/safe_download.py",
         old=(
-            "            target = parse_target(current, self.policy)\n"
-            "            # 把**当前**这一跳记进 visited。不记的话，一个指回起点的重定向\n"
-            "            # 要等到再发一次请求之后才被发现（复核报告 B1）。\n"
-            "            if target.display not in visited:\n"
-            "                visited.append(target.display)\n"
+            (
+            '            target = parse_target(current, self.policy)\n'
+            '            # 把当前这一跳记进 visited。不记的话，一个指回起点的重定向\n'
+            '            # 要等到再发一次请求之后才被发现。\n'
+            '            if target.display not in visited:\n'
+            '                visited.append(target.display)\n'
+        )
         ),
         new="            target = parse_target(current, self.policy)\n",
         test=(
@@ -460,13 +454,13 @@ INJECTIONS: tuple[BugInjection, ...] = (
         name="tool-error-returned-as-normal-result",
         path="src/image_search_mcp/server.py",
         old=(
-            "    outcome = await _search_image_logic(source, engine, extra_params_json, limit)\n"
-            "    if outcome.is_error:\n"
-            "        # 工具执行错误 → 按 MCP 规范用 isError=true 交回给调用方，让它/模型能自我修正。\n"
-            "        # 用 ToolError 而不是让裸异常冒出去：后者的文本会被加上\n"
-            '        # 「Error calling tool \'search_image\': 」前缀（实测），对模型只是噪音。\n'
-            "        raise ToolError(outcome.text)\n"
-            "    return ToolResult(content=outcome.text, structured_content=outcome.structured)"
+            (
+            '    outcome = await _search_image_logic(source, engine, extra_params_json, limit)\n'
+            '    if outcome.is_error:\n'
+            '        # 使用 ToolError 返回工具执行错误。\n'
+            '        raise ToolError(outcome.text)\n'
+            '    return ToolResult(content=outcome.text, structured_content=outcome.structured)'
+        )
         ),
         new=(
             "    outcome = await _search_image_logic(source, engine, extra_params_json, limit)\n"
@@ -624,8 +618,52 @@ INJECTIONS: tuple[BugInjection, ...] = (
         ),
         why=(
             "内层期限检查被删掉：忙转的流能远超总期限才被外层 wait_for 截停"
-            "（复核实测 20 ms 预算跑了 135 ms）。我先前以为两层互相遮挡就删了它，删错了"
+            "；该测试使用不让出执行权的流，验证循环内的期限检查"
         ),
+    ),
+    BugInjection(
+        name="check-conflicting-modes-accepted",
+        path="check.sh",
+        old='if [[ $FAST -eq 1 && $REVERSE_ONLY -eq 1 ]]; then',
+        new='if false; then',
+        test=(
+            "tests/test_check_script.py"
+            "::test_conflicting_modes_cannot_report_success_without_running_checks"
+        ),
+        why="两个模式同时启用会跳过全部检查，却报告成功",
+    ),
+    BugInjection(
+        name="mcp-limit-coercion-enabled",
+        path="src/image_search_mcp/server.py",
+        old="    limit: StrictInt = DEFAULT_LIMIT,",
+        new="    limit: int = DEFAULT_LIMIT,",
+        test=(
+            "tests/test_mcp_contract.py"
+            "::test_mcp_rejects_non_integer_limits_before_search[True]"
+        ),
+        why="框架将布尔值、浮点数和数字字符串转换为整数，绕过工具参数的类型限制",
+    ),
+    BugInjection(
+        name="deploy-env-executed-as-shell",
+        path="image_search_mcp_deploy.sh",
+        old='    [ -f "$ENV_PATH" ] && load_env',
+        new='    [ -f "$ENV_PATH" ] && source "$ENV_PATH"',
+        test=(
+            "tests/test_deploy_script.py"
+            "::test_env_values_are_read_without_executing_shell_commands[--update-only]"
+        ),
+        why="配置值中的命令替换被部署脚本执行",
+    ),
+    BugInjection(
+        name="deploy-auth-probe-failure-ignored",
+        path="image_search_mcp_deploy.sh",
+        old='        *) echo "错误: 鉴权检查返回 ${code}（期望 400），无法确认凭据有效" >&2; return 1 ;;',
+        new='        *) echo "鉴权检查跳过" >&2; return 0 ;;',
+        test=(
+            "tests/test_deploy_script.py"
+            "::test_failed_authentication_probe_fails_deployment[500]"
+        ),
+        why="鉴权检查失败后仍报告更新成功",
     ),
 )
 

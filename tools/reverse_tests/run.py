@@ -1,21 +1,4 @@
-"""反向测试执行器：把每个缺陷放回代码里，确认门禁真的会红。
-
-用法：
-    python tools/reverse_tests/run.py            # 跑全部
-    python tools/reverse_tests/run.py --list     # 只列出注入项
-
-工作方式（这四步缺一步，反向测试就不成立）：
-
-1. 把 ``src/`` ``tests/`` ``pyproject.toml`` 复制到一个临时目录
-2. 在**副本**里做文本替换注入（不动工作区，避免"忘了还原"这种事）
-3. 用 ``PYTHONPATH=<副本>/src`` 跑指定的那条测试，并**先验证导入到的模块
-   确实是副本里的那一份** —— 否则跑的还是干净代码，反向测试是假的
-4. 判定：测试必须**因断言失败**而红（退出码 1）。
-   退出码 2 是收集/用法错误、5 是没收集到测试 —— 那不算抓住，
-   因为"跑不起来"和"发现问题"是两件事。旧门禁恰恰就是在这里骗过自己的。
-
-判定结果分布越是集中在"没抓住"，越说明门禁是摆设。
-"""
+"""反向测试执行器：把每个缺陷放回代码里，确认门禁真的会红。"""
 
 from __future__ import annotations
 
@@ -35,8 +18,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PROBE_TIMEOUT = 60
 TEST_TIMEOUT = 300
 
-#: 只复制这些顶层条目到临时副本（够跑测试就行，不含 tools/ 与 .venv/）
-COPY_ENTRIES = ("src", "tests", "pyproject.toml", "README.md", "LICENSE")
+#: 测试所需文件；不复制 .venv 和构建产物。
+COPY_ENTRIES = (
+    "src", "tests", "tools", "check.sh", "image_search_mcp_deploy.sh",
+    "pyproject.toml", "README.md", "LICENSE",
+)
 
 
 @dataclass

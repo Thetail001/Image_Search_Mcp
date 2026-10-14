@@ -1,18 +1,4 @@
-"""``extra_params`` 校验行为。
-
-重心是**拒绝必须发生在读文件与建网络之前**。
-
-早期版本的写法是"先把 ``file``/``url`` 装好，再 ``search_kwargs.update(extra_params)``"，
-于是调用方可以用 ``{"file": "/etc/passwd"}`` 覆盖输入，而 ``PicImageSearch.utils.read_file()``
-接受路径字符串并直接 ``open()`` —— 服务端任意文件读取，读出来的内容还会被
-multipart 上传到搜索引擎站点。两组对照（正例越权成功、负例在读取函数处失败）
-在本机与远端各证书过一次。
-
-所以这里不仅断言"被拒绝"，还断言**没有产生任何出站请求** —— 但注意
-"没有出站请求"本身**不足以**证明没读文件（读完再拒也满足它）。
-真正证明"在读取之前拒绝"的是 ``test_reserved_file_is_rejected_before_any_read``：
-把读文件函数换成会记录的哨兵，断言它从未被调用。
-"""
+"""``extra_params`` 校验行为。"""
 
 from __future__ import annotations
 

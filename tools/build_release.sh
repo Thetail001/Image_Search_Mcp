@@ -1,20 +1,7 @@
 #!/usr/bin/env bash
-# 打发行产物（wheel + sdist），并打印哈希。
-#
-# 为什么要固定时间戳
-# ------------------
-# zip 与 gzip 会把**构建时刻**写进文件，于是"同一份源码"每次构建得到不同的 sha256。
-# 实测踩过：23:30 构建的 wheel 是 bccaeac9…，00:10 重新构建同一个提交变成 252c6148…，
-# 内容一样、字节不同 —— 结果就是"在真机上验过的那个文件"和"最后发出去的文件"
-# 不是同一个。那正是"发完再测"的另一种形态。
-#
-# 固定成 HEAD 的提交时间之后，同一个提交重复构建得到同一个哈希，
-# "测过的就是发布的"这句话才有可能被验证，而不是靠记忆。
-#
-# 用法
-# ----
-#     tools/build_release.sh          # 工作区必须干净
-#     tools/build_release.sh --check  # 只检查产物是否与当前提交一致（重建后比哈希）
+# 构建 wheel 与 sdist，以 HEAD 提交时间归一化归档元数据。
+# tools/build_release.sh          # 要求 Git 工作区干净
+# tools/build_release.sh --check  # 重复构建并比较产物哈希
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -32,17 +19,9 @@ commit_time="$(git log -1 --format=%cI)"
 build() {
   rm -rf dist
   uv build >/dev/null
-  # 两级都不确定，都要处理：
-  #
-  # 1) gzip 头把"当前时刻"写进 MTIME（实测差的只有那 4 个字节）；
-  # 2) 内层 tar 用的是 Python 默认的 pax 扩展头，里面带**亚秒** mtime ——
-  #    生成文件（PKG-INFO / egg-info）的 mtime 带小数，每次构建都不同。
-  #    实测：解开后文件内容、成员顺序、权限属主时间全一致，可内层 tar 哈希就是不同，
-  #    差的全在 pax 头里。
-  #
-  # 所以：按 GNU tar 格式重建外层 tar（归一化 mtime/属主、丢掉 pax 头），
-  # 再用固定 mtime 重新压。**包内文件内容一个字节不动。**
+  # 归一化 tar 元数据和 gzip 时间戳，保持包内文件内容不变。
   python3 - "$SOURCE_DATE_EPOCH" <<'PY'
+import copy
 import gzip
 import io
 import pathlib
@@ -56,7 +35,10 @@ for path in sorted(pathlib.Path("dist").glob("*.tar.gz")):
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w", format=tarfile.GNU_FORMAT) as dst:
             for member in members:
-                info = member.replace(uid=0, gid=0, uname="", gname="", mtime=epoch)
+                info = copy.copy(member)
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                info.mtime = epoch
                 info.pax_headers = {}
                 payload = src.extractfile(member) if member.isfile() else None
                 dst.addfile(info, payload)

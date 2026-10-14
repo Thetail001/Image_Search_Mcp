@@ -1,14 +1,4 @@
-"""URL 规范化与失败原因归类（复核报告 B1）。
-
-这里盯的是"错误回给调用方的形状"：
-
-- 畸形 URL 必须是 ``invalid_url``，不能漏出裸 ``ValueError``；
-- IPv6 字面量在 authority 段里必须带方括号，否则下一跳重新解析时坏掉；
-- 非 ASCII 主机名必须先转 IDNA，不能等到构造请求时才抛 ``UnicodeEncodeError``；
-- 原因要分得开：单次 I/O 超时 ≠ 连不上，HTTP 状态 ≠ 体积超限。
-
-每条拒绝旁边都有能走通的正例 —— "什么都拒绝"同样能通过一组纯负向测试。
-"""
+"""URL 规范化与失败原因归类（复核报告 B1）。"""
 
 from __future__ import annotations
 

@@ -1,20 +1,4 @@
-"""``extra_params`` 白名单的端到端回归（服务端任意文件读取）。
-
-== 被测的那个缺陷 ==
-
-旧代码的顺序是：
-
-    search_kwargs["file"] = image_bytes          # 先装好输入
-    search_kwargs.update(extra_params)           # 再让调用方覆盖
-
-于是 ``{"file": "/etc/passwd"}`` 能把输入换成一个本地路径，
-而上游 ``utils.read_file()`` 接受路径字符串并直接 ``open()``。
-读出来的内容会跟着 multipart 请求**上传到搜索引擎站点** —— 一个完整的服务端文件外泄。
-
-本文件里有一条 **正对照**（``test_control_detector_catches_the_original_bug``）：
-它显式把校验换回旧行为，然后断言 canary 内容真的出现在出站请求体里。
-没有这条，下面那些"拒绝"的测试可能只是碰巧为真。
-"""
+"""``extra_params`` 白名单的端到端回归（服务端任意文件读取）。"""
 
 from __future__ import annotations
 
@@ -111,13 +95,7 @@ async def test_control_upstream_read_file_would_exfiltrate_any_path(
 async def test_input_is_applied_after_extras_so_it_cannot_be_overridden(
     canary_file, trace_moe_mock, monkeypatch
 ):
-    """第二层防御：即使白名单被绕过，输入也不可能被 extras 覆盖。
-
-    旧代码的顺序是"先装输入、再 update(extras)"，所以 extras 总能赢。
-    现在改成"extras 先落位、输入后落位"，覆盖方向反过来了 ——
-    于是这里把校验整个绕过，canary 依然读不到。
-    两层各自独立，任何一层单独失效都不足以复现那个漏洞。
-    """
+    """第二层防御：即使白名单被绕过，输入也不可能被 extras 覆盖。"""
     monkeypatch.setattr(
         params, "validate_extra_params",
         lambda engine, raw: ({}, dict(raw or {})),   # 旧行为：原样透传

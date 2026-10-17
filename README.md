@@ -288,7 +288,7 @@ python -m venv .venv
 
 发布前运行完整检查与构建验证，再用隔离环境安装生成的 wheel。确认版本号尚未发布后，使用 `twine upload dist/*` 上传。
 
-后续计划见 [ROADMAP](docs/ROADMAP.md)，检查范围见 [实施进度](docs/实施进度.md)。旧审阅报告存放在 [历史文档](docs/archive/README.md)。
+后续计划见 [ROADMAP](docs/ROADMAP.md)，检查范围见 [实施进度](docs/实施进度.md)。
 
 ## License
 

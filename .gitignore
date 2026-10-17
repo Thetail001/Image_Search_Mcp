@@ -56,3 +56,6 @@ tmp/
 
 # 本机用 `uv run --with ...` 做临时探测时生成的锁文件；本项目依赖以 pyproject.toml 为准。
 uv.lock
+
+# 内部工作笔记不入公开仓库
+docs/archive/

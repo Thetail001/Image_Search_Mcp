@@ -83,7 +83,8 @@ def _assert_no_symlink_components(
             raise LocalInputError(missing_code or code, "路径不存在或不可读。") from exc
         except OSError as exc:
             raise LocalInputError(code, "路径中包含无法读取的目录组件。") from exc
-        if stat.S_ISLNK(info.st_mode):
+        if (stat.S_ISLNK(info.st_mode) or
+                getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)):
             raise LocalInputError(code, "路径中包含符号链接，已拒绝。")
 
 
@@ -116,13 +117,18 @@ def validate_roots() -> tuple[Path, ...]:
             raise LocalInputError(
                 "LOCAL_INPUT_DISABLED", f"{ROOTS_VAR} 里必须是目录。"
             )
-        real = Path(os.path.realpath(root))
-        if str(real) in _FORBIDDEN_ROOTS:
+        # Windows must validate the configured spelling while handles are pinned;
+        # resolving it first could hide a junction swapped in after lstat.
+        real = root if os.name == 'nt' else Path(os.path.realpath(root))
+        if str(real) in _FORBIDDEN_ROOTS or real == Path(real.anchor):
             raise LocalInputError(
                 "LOCAL_INPUT_DISABLED",
                 "allowlist 不允许指向系统目录；请使用专门的附件 cache 或 staging 子目录。",
             )
-        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        if os.name == 'nt':
+            from .windows_input import validate_root
+            validate_root(real)
+        elif info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise LocalInputError(
                 "LOCAL_INPUT_DISABLED",
                 "allowlist 目录不能对同组或其他用户可写。",
@@ -184,6 +190,9 @@ def _open_beneath(root: Path, candidate: Path) -> int:
     逐段 ``openat`` 而不是先 realpath 再普通 open：后者在检查与 open 之间有
     TOCTOU 窗口，可以用竞态把读取引到 allowlist 之外。
     """
+    if os.name == 'nt':
+        from .windows_input import open_beneath
+        return open_beneath(root, candidate)
     relative = candidate.relative_to(root)
     parts = [part for part in relative.parts if part not in ("", ".")]
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)

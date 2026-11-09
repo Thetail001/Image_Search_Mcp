@@ -20,10 +20,10 @@ ROOTS_ENV = local_input.ROOTS_VAR
 # --------------------------------------------------------------------------
 
 @pytest.fixture
-def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, private_directory) -> Path:
     directory = tmp_path / "images"
     directory.mkdir()
-    os.chmod(directory, 0o700)
+    private_directory(directory)
     monkeypatch.setenv(ENABLE_ENV, "1")
     monkeypatch.setenv(ROOTS_ENV, str(directory))
     return directory
@@ -38,6 +38,25 @@ def _write(directory: Path, name: str, data: bytes) -> Path:
 
 def _code(exc_info: pytest.ExceptionInfo) -> str:
     return exc_info.value.code
+
+
+def _symlink(link: Path, target: Path, *, target_is_directory=False):
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        if os.name == 'nt' and getattr(exc, 'winerror', None) == 1314:
+            if target_is_directory:
+                # Junctions exercise the same reparse-point gates without admin
+                # or Developer Mode; the target is another disposable test dir.
+                import subprocess
+                result = subprocess.run(
+                    [os.environ.get('COMSPEC', 'cmd.exe'), '/c', 'mklink', '/J', str(link), str(target)],
+                    capture_output=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    return
+            pytest.skip('Windows symlink creation requires an unavailable privilege')
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -71,7 +90,7 @@ def test_symlink_to_outside_is_denied(root: Path, tmp_path: Path):
     outside = tmp_path / "outside.png"
     outside.write_bytes(png_bytes())
     link = root / "link.png"
-    link.symlink_to(outside)
+    _symlink(link, outside)
     with pytest.raises(local_input.LocalInputError) as excinfo:
         local_input.read_image(str(link))
     assert _code(excinfo) == "INPUT_PATH_DENIED"
@@ -81,7 +100,7 @@ def test_symlinked_directory_component_is_denied(root: Path, tmp_path: Path):
     outside_dir = tmp_path / "outside_dir"
     outside_dir.mkdir()
     _write(outside_dir, "a.png", png_bytes())
-    (root / "sub").symlink_to(outside_dir, target_is_directory=True)
+    _symlink(root / "sub", outside_dir, target_is_directory=True)
     with pytest.raises(local_input.LocalInputError) as excinfo:
         local_input.read_image(str(root / "sub" / "a.png"))
     assert _code(excinfo) == "INPUT_PATH_DENIED"
@@ -90,7 +109,7 @@ def test_symlinked_directory_component_is_denied(root: Path, tmp_path: Path):
 def test_symlink_component_check_is_a_real_gate(root: Path, tmp_path: Path):
     """第一道（逐段 lstat）自己也要能拦；否则它只是装饰。"""
     link = root / "link-dir"
-    link.symlink_to(tmp_path, target_is_directory=True)
+    _symlink(link, tmp_path, target_is_directory=True)
     with pytest.raises(local_input.LocalInputError) as excinfo:
         local_input._assert_no_symlink_components(link, code="INPUT_PATH_DENIED")
     assert _code(excinfo) == "INPUT_PATH_DENIED"
@@ -101,7 +120,7 @@ def test_open_beneath_refuses_symlink_components(root: Path, tmp_path: Path):
     outside_dir = tmp_path / "outside-open"
     outside_dir.mkdir()
     (outside_dir / "a.png").write_bytes(png_bytes())
-    (root / "sub").symlink_to(outside_dir, target_is_directory=True)
+    _symlink(root / "sub", outside_dir, target_is_directory=True)
     with pytest.raises(local_input.LocalInputError) as excinfo:
         local_input._open_beneath(root, root / "sub" / "a.png")
     assert _code(excinfo) == "INPUT_PATH_DENIED"
@@ -154,6 +173,7 @@ def test_directory_is_rejected(root: Path):
     assert _code(excinfo) == "INPUT_FILE_UNAVAILABLE"
 
 
+@pytest.mark.skipif(not hasattr(os, 'mkfifo'), reason='POSIX FIFO is unavailable')
 def test_fifo_is_rejected_without_blocking(root: Path):
     fifo = root / "pipe"
     os.mkfifo(fifo, 0o600)
@@ -289,7 +309,7 @@ def test_symlinked_root_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     real = tmp_path / "real"
     real.mkdir()
     link = tmp_path / "link-root"
-    link.symlink_to(real, target_is_directory=True)
+    _symlink(link, real, target_is_directory=True)
     monkeypatch.setenv(ENABLE_ENV, "1")
     monkeypatch.setenv(ROOTS_ENV, str(link))
     with pytest.raises(local_input.LocalInputError):
@@ -301,20 +321,31 @@ def test_group_or_world_writable_root_is_rejected(
 ):
     directory = tmp_path / "loose"
     directory.mkdir()
-    os.chmod(directory, 0o777)
+    if os.name == 'nt':
+        import win32con
+        import win32security as security
+        dacl = security.ACL()
+        dacl.AddAccessAllowedAce(security.ACL_REVISION, win32con.GENERIC_ALL,
+                                security.ConvertStringSidToSid('S-1-1-0'))
+        security.SetNamedSecurityInfo(str(directory), security.SE_FILE_OBJECT,
+            security.DACL_SECURITY_INFORMATION | security.PROTECTED_DACL_SECURITY_INFORMATION,
+            None, None, dacl, None)
+    else:
+        os.chmod(directory, 0o777)
     monkeypatch.setenv(ENABLE_ENV, "1")
     monkeypatch.setenv(ROOTS_ENV, str(directory))
-    assert directory.stat().st_mode & stat.S_IWOTH
+    if os.name != 'nt':
+        assert directory.stat().st_mode & stat.S_IWOTH
     with pytest.raises(local_input.LocalInputError):
         local_input.validate_roots()
 
 
-def test_multiple_roots_are_supported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_multiple_roots_are_supported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, private_directory):
     first = tmp_path / "a"
     second = tmp_path / "b"
     for directory in (first, second):
         directory.mkdir()
-        os.chmod(directory, 0o700)
+        private_directory(directory)
     monkeypatch.setenv(ENABLE_ENV, "1")
     monkeypatch.setenv(ROOTS_ENV, os.pathsep.join([str(first), str(second)]))
     roots = local_input.validate_roots()

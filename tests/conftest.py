@@ -14,6 +14,33 @@ import pytest
 #: 漏一个就意味着测试行为取决于开发机上残留的变量。
 CONFIG_ENV_PREFIXES = ("IMAGE_SEARCH_", "MCP_")
 
+
+@pytest.fixture
+def private_directory():
+    """Restrict newly created test directories; never change a user directory."""
+    def protect(directory):
+        if os.name != 'nt':
+            os.chmod(directory, 0o700)
+            return
+        import win32api
+        import win32con
+        import win32security as security
+        token = security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+        try:
+            user = security.GetTokenInformation(token, security.TokenUser)[0]
+        finally:
+            token.Close()
+        dacl = security.ACL()
+        for sid in (user, security.ConvertStringSidToSid('S-1-5-18'),
+                    security.ConvertStringSidToSid('S-1-5-32-544')):
+            dacl.AddAccessAllowedAceEx(security.ACL_REVISION,
+                win32con.OBJECT_INHERIT_ACE | win32con.CONTAINER_INHERIT_ACE,
+                win32con.GENERIC_ALL, sid)
+        security.SetNamedSecurityInfo(str(directory), security.SE_FILE_OBJECT,
+            security.DACL_SECURITY_INFORMATION | security.PROTECTED_DACL_SECURITY_INFORMATION,
+            None, None, dacl, None)
+    return protect
+
 #: 没有前缀可循、且**不该**被采用的代理类变量：同样要清 ——
 #: 否则开发机上残留一个 HTTP_PROXY，会让"环境代理不生效"这条承诺看起来成立。
 BARE_PROXY_ENV_VARS = (

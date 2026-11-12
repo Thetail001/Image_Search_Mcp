@@ -265,6 +265,10 @@ allowlist 目录本身不能是 `/`、`/root`、`/tmp` 等系统目录，也不�
 
 ## Linux 部署脚本
 
+> **现网注意**：本仓库作者的线上实例并不是用这个脚本部署的，而是把版本钉在一个自定义
+> `start.sh` 里的 `uvx image-search-mcp==<版本>`。升级前先核对线上实际的 `ExecStart`
+> 与版本钉在哪，否则会以为自己在升级、实际什么也没换。
+
 `image_search_mcp_deploy.sh` 适用于使用 apt 和 systemd 的 Linux 系统，通过 uv 安装并运行服务：
 
 ```bash

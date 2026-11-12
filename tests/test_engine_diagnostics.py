@@ -39,14 +39,34 @@ def test_upstream_parsing_error_is_reported_as_upstream_change():
     assert "别立刻重试" in outcome.text
 
 
-@pytest.mark.parametrize("exc", [KeyError("query_hash"), IndexError("list index out of range")])
+@pytest.mark.parametrize(
+    "exc",
+    [
+        KeyError("query_hash"),
+        IndexError("list index out of range"),
+        ValueError("BCID not found on page"),
+    ],
+)
 def test_missing_field_errors_are_classified_as_response_shape(exc):
-    """上游响应缺字段时库直接抛 KeyError/IndexError，要给可判读的说明。"""
+    """上游响应缺字段或格式不对时，要给可判读的说明而不是"内部错误"。"""
     outcome = server._outcome_for_exception(exc, "Tineye")
 
     assert outcome.is_error is True
-    assert "缺少解析器需要的字段" in outcome.text
+    assert "与解析器预期不符" in outcome.text
     assert type(exc).__name__ in outcome.text
+    assert "内部错误" not in outcome.text
+
+
+def test_json_decode_error_is_classified_as_intercepted_response():
+    """被拦截后拿回拦截页（HTML）而不是 JSON 时，不能报成内部错误。"""
+    import json
+
+    exc = json.JSONDecodeError("Expecting value", "<html>Just a moment...</html>", 0)
+    outcome = server._outcome_for_exception(exc, "Tineye")
+
+    assert outcome.is_error is True
+    assert "JSONDecodeError" in outcome.text
+    assert "拦截" in outcome.text or "限流" in outcome.text
     assert "内部错误" not in outcome.text
 
 

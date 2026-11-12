@@ -575,16 +575,18 @@ def _outcome_for_exception(exc: Exception, engine: Optional[str]) -> SearchOutco
             ),
             is_error=True,
         )
-    # 解析器拿到的 JSON/HTML 里缺字段时，上游库通常直接抛 KeyError/IndexError。
-    # 与上面的 ParsingError 分开写，是因为这类失败可能也来自我们传错参数，
-    # 所以保留完整堆栈进日志，对外只说"响应结构与预期不符"。
-    if isinstance(exc, (KeyError, IndexError)):
-        logger.exception("上游响应结构不符 engine=%s", engine)
+    # 解析器拿到的 JSON/HTML 里缺字段、或内容根本不是预期格式时，
+    # 上游库通常直接抛 KeyError/IndexError/JSONDecodeError/ValueError。
+    # 与上面的 ParsingError 分开写，是因为这类失败也可能来自我们传错参数，
+    # 所以保留完整堆栈进日志，对外只说"响应内容与预期不符"。
+    if isinstance(exc, (KeyError, IndexError, json.JSONDecodeError, ValueError)):
+        logger.exception("上游响应内容与预期不符 engine=%s", engine)
         return SearchOutcome(
             text=(
-                f"Error: {engine} 上游响应缺少解析器需要的字段"
-                f"（{type(exc).__name__}）。可能是上游改版，也可能是该引擎需要额外配置"
-                "（如 API key 或 Cookies）；详细信息见服务端日志。"
+                f"Error: {engine} 上游返回的内容与解析器预期不符"
+                f"（{type(exc).__name__}）。常见原因是上游改版，或者请求被拦截/限流后"
+                "回了拦截页而不是数据；也可能是该引擎需要额外配置（API key 或 Cookies）。"
+                "换用其他引擎，或稍后重试；详细信息见服务端日志。"
             ),
             is_error=True,
         )

@@ -34,6 +34,11 @@ from PicImageSearch import (
     Yandex,
 )
 
+#: 上游解析器在"页面结构变了 / 找不到预期字段"时抛的专用异常。
+#: 单独拎出来分类，是因为这类失败不是输入问题、也不是我们代码的问题，
+#: 而是上游站点改版——归进"内部错误"会让调用方和运维都判错方向。
+from PicImageSearch.exceptions import ParsingError as UpstreamParsingError
+
 from . import local_input, params
 from .local_input import LocalInputError
 from .credentials import (
@@ -75,7 +80,13 @@ ENGINES: dict[str, type] = {
 LIMIT_MIN = 1
 LIMIT_MAX = 50
 DEFAULT_LIMIT = 5
-DEFAULT_ENGINE = "Yandex"
+#: 默认引擎只做一件事：默认要能出结果。
+#: Yandex 自 2026-11 起把结果页改成前端渲染，服务端首屏只剩空壳
+#: （cbirSites.sites=[]、cbirIntent.status="loading"），PicImageSearch
+#: 3.12.11 与 main 分支都只解析首屏，因此必然抛 ParsingError。
+#: 实测能出结果的只有 BaiDu 与 Tineye，默认改用 BaiDu（服务端自己取图、
+#: 结果带标题与来源页）。要用别的引擎设 IMAGE_SEARCH_DEFAULT_ENGINE。
+DEFAULT_ENGINE = "BaiDu"
 DEFAULT_ENGINE_ENV = "IMAGE_SEARCH_DEFAULT_ENGINE"
 ALL_ENGINE = "All"
 SEARCH_TOTAL_TIMEOUT = 60.0
@@ -88,6 +99,47 @@ MAX_URL_CHARS = 4096
 #: 本机 stdio 模式下允许直接吃 ``file: bytes`` 的引擎集合。
 #: 必须由测试对着上游 ``search()`` 签名核对，不能手抄。
 LOCAL_FILE_ENGINES: frozenset[str] = frozenset(ENGINES)
+
+#: 已实测确认"上游改版导致不可用"的引擎 → 原因说明。
+#:
+#: 这张表的用途不是给用户看热闹，是让 ``get_engine_info`` 能直接回答
+#: "现在该用哪个引擎"，而不是把一个注定失败的名字仍然当成正常选项。
+#: 实测方法见 ``tools/engine_health.py``；判定证据记录在 docs/ROADMAP.md。
+KNOWN_ENGINE_ISSUES: dict[str, str] = {
+    "Yandex": (
+        "2026-11-13 实测对请求频率敏感：短时间连续请求会被软限流——上游返回"
+        "「预搜索」空壳（cbirSites.sites=[]、cbirIntent.status=loading），库据此抛"
+        "UpstreamParsingError。静置后间隔 8 秒再查，连续 4/4 成功、每次 81 条。"
+        "所以这不是改版导致的永久失效，重试前先停下来等几分钟。"
+    ),
+    "Iqdb": (
+        "2026-11-13 实测对请求频率敏感：被判定为机器人后 302 跳到 "
+        "index.php?botcheck=failed 并返回空页，解析器抛 IndexError。"
+    ),
+    "Tineye": (
+        "2026-11-13 部分可用：能出结果，但缺少 query_hash 时会抛 KeyError，属于"
+        "上游响应不稳定，调用方需能接受偶发失败。"
+    ),
+    "Bing": (
+        "2026-11-13 实测不可用：上传流程改版，抛 ValueError('BCID not found on page')。"
+    ),
+    "GoogleLens": (
+        "2026-11-13 实测返回空结果（url 与 file 两种输入都是 0 条）；"
+        "可能是反爬或需要 Cookies，未确认。"
+    ),
+    "Google": "2026-11-13 实测返回空结果（url 与 file 两种输入都是 0 条），未确认原因。",
+    "SauceNAO": (
+        "2026-11-13 网页路径被 Cloudflare 人机挑战挡住（403 + cf-mitigated: challenge）；"
+        "配置 IMAGE_SEARCH_API_KEY 走官方 API 才可能恢复。"
+    ),
+}
+
+
+def _engine_issue_note(engine: str) -> str:
+    """返回某引擎的已知问题说明；没有则返回空串。"""
+    issue = KNOWN_ENGINE_ISSUES.get(engine)
+    return f"（已知问题）{issue}" if issue else ""
+
 
 
 def _input_capabilities() -> str:
@@ -247,7 +299,14 @@ def get_engine_info(engine_name: str = "all") -> str:
         lines = ["Supported Search Engines:"]
         lines.append("- All: 查询全部引擎；limit 按每个引擎计算，单个引擎失败不影响其他结果。")
         for name in params.CONTRACTS:
-            lines.append(f"- {name}: {params.engine_brief(name, local_enabled=local_enabled)}")
+            note = _engine_issue_note(name)
+            lines.append(f"- {name}: {params.engine_brief(name, local_enabled=local_enabled)}{note}")
+        if KNOWN_ENGINE_ISSUES:
+            lines.append("")
+            lines.append(
+                "Availability warning: 上表带「已知问题」的引擎在最近一次实测中不可用或"
+                "结果为空。选引擎前请优先用不带警告的（实测可用：BaiDu；部分可用：Tineye）。"
+            )
         if local_enabled:
             lines.append("")
             lines.append("Local file input support:")
@@ -261,8 +320,10 @@ def get_engine_info(engine_name: str = "all") -> str:
     local_enabled = local_input.enabled()
     for name in params.CONTRACTS:
         if name.lower() == engine_name.lower():
+            issue = _engine_issue_note(name)
             return (
                 params.engine_details(name, local_enabled=local_enabled)
+                + (f"\n\n{issue}" if issue else "")
                 + "\n\n"
                 + _input_capabilities()
             )
@@ -497,6 +558,35 @@ def _outcome_for_exception(exc: Exception, engine: Optional[str]) -> SearchOutco
     if isinstance(exc, DownloadError):
         return SearchOutcome(
             text=f"Error: 取图失败 [{exc.reason}] {exc}", is_error=True
+        )
+    # 上游站点改版：首屏结构不再包含解析器要找的字段。
+    # 这类失败要如实说成"上游变了"，不能报成"内部错误"——否则排查会走错方向。
+    if isinstance(exc, UpstreamParsingError):
+        logger.warning(
+            "上游页面结构变化 engine=%s detail=%s", engine, _redact_upstream(str(exc))
+        )
+        return SearchOutcome(
+            text=(
+                f"Error: {engine} 上游返回的页面里没有解析器需要的结果字段"
+                "（UpstreamParsingError）。两种可能：一是该引擎改版或改成前端渲染，"
+                "二是请求被上游临时限流、只拿到空壳页——实测 Yandex 短时间连续请求"
+                "就会这样。先换其他引擎；确实要用它，就停下来等几分钟再试一次，"
+                "别立刻重试。服务端已记录原始信息。"
+            ),
+            is_error=True,
+        )
+    # 解析器拿到的 JSON/HTML 里缺字段时，上游库通常直接抛 KeyError/IndexError。
+    # 与上面的 ParsingError 分开写，是因为这类失败可能也来自我们传错参数，
+    # 所以保留完整堆栈进日志，对外只说"响应结构与预期不符"。
+    if isinstance(exc, (KeyError, IndexError)):
+        logger.exception("上游响应结构不符 engine=%s", engine)
+        return SearchOutcome(
+            text=(
+                f"Error: {engine} 上游响应缺少解析器需要的字段"
+                f"（{type(exc).__name__}）。可能是上游改版，也可能是该引擎需要额外配置"
+                "（如 API key 或 Cookies）；详细信息见服务端日志。"
+            ),
+            is_error=True,
         )
     # 详细堆栈仅写入日志，客户端只接收异常类型。
     logger.exception("图片搜索失败 engine=%s", engine)
@@ -781,12 +871,38 @@ _UPSTREAM_ERROR_ATTRS: dict[str, tuple[str, ...]] = {
 
 
 def _redact_upstream(message: str, limit: int = 200) -> str:
-    """隐藏上游错误文本中的 Base64 data URI，并限制文本长度。"""
+    """隐藏上游错误文本中的 Base64 data URI 与凭据参数，并限制文本长度。"""
     text = re.sub(
         r"data:[\w.+-]+/[\w.+-]+;base64,[A-Za-z0-9+/=]+", "data:<redacted>", message
     )
+    # 上游 URL 与错误体里可能带 key/token，进日志前一律打码。
+    for key in ("api_key", "apikey", "token", "key", "secret", "password"):
+        text = re.sub(
+            rf"(?i)\b({key})=[^&\s\"']+", rf"\1=<redacted>", text
+        )
     text = " ".join(text.split())
     return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _upstream_body_snippet(response: Any, limit: int = 200) -> str:
+    """取上游响应体的一小段用于日志取证；任何取不到的路径都返回空串。
+
+    以前这里不留证据，导致 Cloudflare 的 ``Just a moment...`` 403 在
+    三万多行服务日志里一条记录都没有，只能靠现场复现——代价太大。
+    """
+    origin = getattr(response, "origin", None)
+    if origin is None:
+        return ""
+    for attr in ("text", "content"):
+        try:
+            value = getattr(origin, attr, None)
+        except Exception:  # pragma: no cover - 上游对象的惰性属性可能抛错
+            return ""
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        if isinstance(value, str) and value:
+            return _redact_upstream(value, limit)
+    return ""
 
 
 def _upstream_error(engine: str, response: Any) -> Optional[str]:
@@ -796,6 +912,13 @@ def _upstream_error(engine: str, response: Any) -> Optional[str]:
 
     code = getattr(response, "status_code", None)
     if isinstance(code, int) and not isinstance(code, bool) and code >= 400:
+        # 只留状态码和一段打码后的响应体；不记 URL（可能带凭据）。
+        logger.warning(
+            "上游返回错误状态 engine=%s code=%s body=%s",
+            engine,
+            code,
+            _upstream_body_snippet(response),
+        )
         return f"上游 HTTP {code}"
 
     for attr in _UPSTREAM_ERROR_ATTRS.get(engine, ()):

@@ -28,7 +28,9 @@ def selected_engines(monkeypatch):
 
 
 @pytest.mark.parametrize("engine,configured,expected", [
-    (None, "", "Yandex"),
+    # 环境变量为空时回退到常量本身；断言常量而不是字面量，
+    # 这样换默认引擎只需改 server.DEFAULT_ENGINE 一处。
+    (None, "", server.DEFAULT_ENGINE),
     (None, " tracemoe ", "TraceMoe"),
     ("yandex", "Ascii2D", "Yandex"),
     ("Yandex", "Unknown", "Yandex"),

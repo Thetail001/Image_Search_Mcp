@@ -98,19 +98,35 @@ SSE 地址为 `/sse`，消息端点为 `/messages/`。远程 MCP 配置格式取
 
 | 名称 | 用途与说明 |
 | --- | --- |
-| `Yandex` | 通用图片来源与相似图片搜索，默认引擎 |
+| `BaiDu` | 百度识图，通用图片来源与相似图片搜索，**默认引擎** |
+| `Tineye` | 图片来源与重复图片搜索 |
 | `SauceNAO` | 插画、漫画与动漫图片来源，可配置 API Key |
 | `TraceMoe` | 根据动漫截图查询番剧、集数和时间点 |
 | `Ascii2D` | 插画来源查询，支持颜色与特征搜索 |
 | `EHentai` | E-Hentai / ExHentai 图库搜索；ExHentai 需要 Cookies |
 | `Iqdb` | 多个插画站点的相似图片搜索 |
-| `BaiDu` | 百度识图 |
 | `GoogleLens` | Google Lens 图片搜索 |
-| `Tineye` | 图片来源与重复图片搜索 |
 | `Google` | 已标记弃用，建议使用 `GoogleLens` |
 | `Bing` | 实验性；当前支持的上游版本可能返回空结果 |
+| `Yandex` | 限流敏感：静置后间隔 8 秒可正常返回（实测 81 条/次），短时间连打会拿到空壳页并报 `UpstreamParsingError` |
 
-引擎是否能返回结果取决于图片、索引覆盖、网络和上游限制。用 `get_engine_info` 查看各引擎的参数与支持状态。
+引擎是否能返回结果取决于图片、索引覆盖、网络和上游限制。用 `get_engine_info` 查看各引擎的参数与支持状态——它会把已知问题直接标在对应条目上。
+
+### 上游可用性（会变，别当常量）
+
+2026-11-13 实测（测试图＝维基埃菲尔铁塔）：`BaiDu` 8 条、`Yandex` 81 条（限流敏感）、`Tineye` 10 条可用；`Iqdb` 被机器人检测拦；`Bing` 上传流程改版报错；`GoogleLens`、`Google`、`SauceNAO` 返回空结果。
+
+**注意**：连通性探测自身就是压力源。一次性连打几十次会让上游对你软限流，之后看到的"永久失效"其实是自找的。复测时把间隔拉到 5 秒以上、一次只打一张图，结论才可信。
+
+这类变化**单元测试抓不到**——测试用的是录制/模拟响应，能防"代码被改坏"，防不住"上游改版"。所以另有看门狗真打上游：
+
+```bash
+python tools/engine_health.py                    # 查全部引擎，出表格
+python tools/engine_health.py --required BaiDu   # 必须可用的引擎失守时退出码 1（可挂 cron/CI）
+python tools/engine_health.py --json             # 机器可读
+```
+
+它默认每次请求间隔 5 秒，只打 1 张固定测试图，避免被上游判成爬虫。`BaiDu` 当前的已知问题是"结果为空即视为失守"——空结果不能当通过。
 
 ## 配置
 
@@ -122,7 +138,7 @@ SSE 地址为 `/sse`，消息端点为 `/messages/`。远程 MCP 配置格式取
 | `IMAGE_SEARCH_API_KEY` | SauceNAO API Key |
 | `IMAGE_SEARCH_COOKIES_<ENGINE>` | 指定引擎的 Cookies，后缀使用大写引擎名，如 `YANDEX`、`EHENTAI` |
 | `IMAGE_SEARCH_PROXY` | 搜索引擎请求使用的代理，如 `http://127.0.0.1:7890` |
-| `IMAGE_SEARCH_DEFAULT_ENGINE` | 未指定 `engine` 时使用的引擎，默认 `Yandex`；可设为 `All` |
+| `IMAGE_SEARCH_DEFAULT_ENGINE` | 未指定 `engine` 时使用的引擎，默认 `BaiDu`；可设为 `All` |
 | `IMAGE_SEARCH_ALLOWED_ORIGINS` | 允许的浏览器来源，逗号分隔，如 `https://client.example` |
 | `IMAGE_SEARCH_ALLOW_ANONYMOUS` | 设为 `1` 时开启仅限回环地址的匿名 HTTP 调试模式 |
 | `IMAGE_SEARCH_LOCAL_INPUT` | 设为 `1` 时在本机 stdio 模式启用 `search_local_image`；HTTP/SSE 下设置它会拒绝启动 |
@@ -148,7 +164,7 @@ Cookies 只发送给对应引擎的域名，并且仅通过 HTTPS 发送。旧�
 | 参数 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `source` | string | 必填 | 绝对 `http://` / `https://` 图片 URL，最长 4096 字符 |
-| `engine` | string 或 null | 环境配置或 `Yandex` | 名称不区分大小写；`All` 查询全部引擎；省略或 null 时使用默认引擎 |
+| `engine` | string 或 null | 环境配置或 `BaiDu` | 名称不区分大小写；`All` 查询全部引擎；省略或 null 时使用默认引擎 |
 | `extra_params_json` | string 或 null | null | 引擎参数的 JSON 字符串；省略、空字符串和 JSON `null` 均表示不传参数 |
 | `limit` | integer | 5 | 返回条数，范围为 1–50 |
 
@@ -221,7 +237,7 @@ All 模式还返回 `engine_outcomes`，记录每个引擎的 `success`、`no_re
 | 参数 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `path` | string | 必填 | 本机绝对路径；必须位于 `IMAGE_SEARCH_LOCAL_ROOTS` 的 allowlist 目录内，且路径中任何一段都不能是符号链接 |
-| `engine` | string 或 null | 环境配置或 `Yandex` | 与 `search_image` 相同；`All` 只查询支持本地文件字节的引擎 |
+| `engine` | string 或 null | 环境配置或 `BaiDu` | 与 `search_image` 相同；`All` 只查询支持本地文件字节的引擎 |
 | `extra_params_json` | string 或 null | null | 与 `search_image` 相同的引擎参数契约 |
 | `limit` | integer | 5 | 返回条数，范围为 1–50 |
 
@@ -230,7 +246,7 @@ All 模式还返回 `engine_outcomes`，记录每个引擎的 `success`、`no_re
 ```json
 {
   "path": "/srv/image-search/inbox/photo.jpg",
-  "engine": "Yandex",
+  "engine": "BaiDu",
   "limit": 5
 }
 ```

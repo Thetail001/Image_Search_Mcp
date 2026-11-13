@@ -88,6 +88,14 @@ DEFAULT_LIMIT = 5
 #: 结果带标题与来源页）。要用别的引擎设 IMAGE_SEARCH_DEFAULT_ENGINE。
 DEFAULT_ENGINE = "BaiDu"
 DEFAULT_ENGINE_ENV = "IMAGE_SEARCH_DEFAULT_ENGINE"
+
+#: 默认引擎报错时的兜底顺序（逗号分隔，可用 IMAGE_SEARCH_FALLBACK_ENGINES 覆盖）。
+#: 只在调用方**没有显式指定引擎**时生效；显式指定就等于"就要这个"，不偷偷换人。
+#: 设为空字符串可关闭兜底。
+FALLBACK_ENV = "IMAGE_SEARCH_FALLBACK_ENGINES"
+DEFAULT_FALLBACK_ENGINES: tuple[str, ...] = ("BaiDu",)
+#: 单次兜底尝试的时限；整体仍受 SEARCH_TOTAL_TIMEOUT 约束。
+FALLBACK_ATTEMPT_TIMEOUT = 30.0
 ALL_ENGINE = "All"
 SEARCH_TOTAL_TIMEOUT = 60.0
 ALL_ENGINE_TIMEOUT = 20.0
@@ -182,6 +190,14 @@ SEARCH_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "engine": {"type": "string", "description": "本次实际使用的引擎"},
+        "fallback_from": {
+            "type": ["string", "null"],
+            "description": "发生兜底时，原本要用的默认引擎；未兜底时不存在该字段",
+        },
+        "fallback_reason": {
+            "type": ["string", "null"],
+            "description": "发生兜底时，默认引擎失败的原因原文",
+        },
         "result_count": {"type": "integer", "description": "上游返回的结果总数"},
         "returned": {"type": "integer", "description": "本次实际返回的条数"},
         "truncated": {"type": "boolean", "description": "是否因为 limit 而截断"},
@@ -609,19 +625,92 @@ async def _search_image_logic(
     *,
     _prepared_input: dict[str, Any] | None = None,
 ) -> SearchOutcome:
-    """执行 URL 搜索，将输入、配置和上游异常整理成 SearchOutcome。"""
+    """执行 URL 搜索，将输入、配置和上游异常整理成 SearchOutcome。
+
+    未显式指定引擎（``engine`` 为 None）时，若默认引擎报错，会按
+    ``IMAGE_SEARCH_FALLBACK_ENGINES`` 的顺序自动换下一个引擎重试一次。
+    显式指定引擎时不做兜底——调用方点名要哪个就用哪个，失败也让调用方知道。
+    """
     try:
         # 输入校验必须早于引擎解析与 All 分发：否则 mock/分发层会绕过它。
         _validate_image_url(source)
         resolved_engine = _resolve_engine(engine)
         if resolved_engine == ALL_ENGINE:
             return await _run_all_search(source, extra_params_json, limit)
-        return await asyncio.wait_for(
+
+        primary = await asyncio.wait_for(
             _run_search(source, resolved_engine, extra_params_json, limit, prepared_input=_prepared_input),
             SEARCH_TOTAL_TIMEOUT,
         )
+        # 兜底只针对"报错"，不针对"空结果"：空结果是一次成功的搜索，
+        # 说明上游没有这张图的记录，换引擎重查等于把同一次查询做两遍。
+        if engine is None and primary.is_error:
+            return await _fallback_search(
+                source, resolved_engine, primary, extra_params_json, limit,
+                prepared_input=_prepared_input,
+            )
+        return primary
     except Exception as exc:  # noqa: BLE001 - 统一交给 _outcome_for_exception 分流
         return _outcome_for_exception(exc, engine)
+
+
+async def _fallback_search(
+    source: str,
+    primary_engine: str,
+    primary_outcome: SearchOutcome,
+    extra_params_json: Optional[str],
+    limit: int,
+    *,
+    prepared_input: dict[str, Any] | None = None,
+) -> SearchOutcome:
+    """默认引擎报错后，按兜底链依次重试；全失败则把每次的失败原因都报出来。"""
+    chain = _fallback_chain(primary_engine)
+    if not chain:
+        return primary_outcome
+
+    deadline = asyncio.get_running_loop().time() + SEARCH_TOTAL_TIMEOUT
+    failures = [f"{primary_engine}: {primary_outcome.text.splitlines()[0]}"]
+    for candidate in chain:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            failures.append(f"{', '.join(chain)}: 总期限已到，未全部尝试")
+            break
+        try:
+            outcome = await asyncio.wait_for(
+                _run_search(source, candidate, extra_params_json, limit,
+                            prepared_input=prepared_input),
+                min(FALLBACK_ATTEMPT_TIMEOUT, remaining),
+            )
+        except asyncio.TimeoutError:
+            failures.append(f"{candidate}: 超时")
+            continue
+        except Exception as exc:  # noqa: BLE001 - 单个兜底引擎失败不应中断兜底链
+            failures.append(f"{candidate}: {type(exc).__name__}: {str(exc)[:120]}")
+            continue
+
+        if not outcome.is_error:
+            reason = primary_outcome.text.splitlines()[0]
+            note = (
+                f"Note: 默认引擎 {primary_engine} 本次不可用（{reason}），"
+                f"以下结果来自兜底引擎 {candidate}。"
+            )
+            structured = dict(outcome.structured or {})
+            structured["engine"] = candidate
+            structured["fallback_from"] = primary_engine
+            structured["fallback_reason"] = primary_outcome.text
+            return SearchOutcome(
+                text=f"{note}\n\n{outcome.text}",
+                structured=structured,
+            )
+        failures.append(f"{candidate}: {outcome.text.splitlines()[0]}")
+
+    return SearchOutcome(
+        text=(
+            "Error: 默认引擎与兜底引擎都没能出结果。\n"
+            + "\n".join(f"  - {line}" for line in failures)
+        ),
+        is_error=True,
+    )
 
 
 async def _search_local_image_logic(
@@ -655,6 +744,27 @@ async def _search_local_image_logic(
         )
     except Exception as exc:  # noqa: BLE001 - 统一交给 _outcome_for_exception 分流
         return _outcome_for_exception(exc, engine)
+
+
+def _fallback_chain(primary: str) -> list[str]:
+    """把 IMAGE_SEARCH_FALLBACK_ENGINES 解析成兜底引擎名列表。
+
+    结构：忽略未知名字、去掉主引擎自身、去重、大小写不敏感。
+    显式设成空字符串表示"不要兜底"。
+    """
+    raw = os.environ.get(FALLBACK_ENV)
+    names = list(DEFAULT_FALLBACK_ENGINES) if raw is None else [
+        part.strip() for part in raw.split(",") if part.strip()
+    ]
+    chain: list[str] = []
+    for name in names:
+        canonical = next(
+            (known for known in ENGINES if known.casefold() == name.casefold()), None
+        )
+        if canonical is None or canonical == primary or canonical in chain:
+            continue
+        chain.append(canonical)
+    return chain
 
 
 def _resolve_engine(engine: Optional[str]) -> str:

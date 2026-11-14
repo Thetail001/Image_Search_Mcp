@@ -270,6 +270,8 @@ All 模式还返回 `engine_outcomes`，记录每个引擎的 `success`、`no_re
 
 allowlist 目录本身不能是 `/`、`/root`、`/tmp` 等系统目录，也不能对同组或其他用户可写。目录内不要放不可信用户可写的文件；本工具只按真实路径与逐段符号链接检查来限制读范围，不处理 bind mount 之类的挂载重定向。
 
+Windows 本机输入使用原生文件句柄和 ACL（安装时仅在 Windows 添加 `pywin32` 依赖），不使用 POSIX 权限位或 `openat`。请使用专门的本地图片目录：所有者及有效写入授权只接受当前进程用户、SYSTEM 和 Administrators；服务不会自动修改目录权限。目录联接、符号链接及其他 reparse point、UNC/设备路径和备用数据流均被拒绝。读取时持有祖先目录句柄以阻止重命名，并核对打开后文件的真实路径；Linux 的原有读取分支不变。
+
 ### `get_engine_info`
 
 `engine_name` 默认为 `all`，返回全部引擎的简要说明。传入引擎名时返回该引擎的参数、默认值及支持状态。两种返回都会附带当前输入能力说明：远程模式为 URL-only、无上传端点、哪些引擎由服务端代抓；本机 stdio 且启用本地输入时，还会列出 `search_local_image` 与每个引擎的本地 file 字节支持情况。

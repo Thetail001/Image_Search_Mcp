@@ -32,6 +32,7 @@ dependencies = [
     "pydantic>=2,<3",
     "starlette>=0.40,<2",
     "uvicorn>=0.30",
+    "pywin32>=312; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

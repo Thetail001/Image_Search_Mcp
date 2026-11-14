@@ -750,7 +750,8 @@ INJECTIONS: tuple[BugInjection, ...] = (
         name="local-symlink-components-followed",
         path="src/image_search_mcp/local_input.py",
         old=(
-            "        if stat.S_ISLNK(info.st_mode):\n"
+            "        if (stat.S_ISLNK(info.st_mode) or\n"
+            "                getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)):\n"
             '            raise LocalInputError(code, "路径中包含符号链接，已拒绝。")'
         ),
         new=(

@@ -16,10 +16,10 @@ ROOTS_ENV = local_input.ROOTS_VAR
 
 
 @pytest.fixture
-def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, private_directory) -> Path:
     directory = tmp_path / "images"
     directory.mkdir()
-    os.chmod(directory, 0o700)
+    private_directory(directory)
     monkeypatch.setenv(ENABLE_ENV, "1")
     monkeypatch.setenv(ROOTS_ENV, str(directory))
     return directory
